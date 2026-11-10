@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleDevelopmentRegion</key>
+    <string>en</string>
+    <key>CFBundleDisplayName</key>
+    <string>HamShack++</string>
+    <key>CFBundleExecutable</key>
+    <string>HamShack++</string>
+    <key>CFBundleIconFile</key>
+    <string>AppIcon</string>
+    <key>CFBundleIdentifier</key>
+    <string>io.hamshack.plusplus</string>
+    <key>CFBundleInfoDictionaryVersion</key>
+    <string>6.0</string>
+    <key>CFBundleName</key>
+    <string>HamShack++</string>
+    <key>CFBundlePackageType</key>
+    <string>APPL</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0.0</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>LSMinimumSystemVersion</key>
+    <string>12.0</string>
+    <key>NSHighResolutionCapable</key>
+    <true/>
+    <key>NSPrincipalClass</key>
+    <string>NSApplication</string>
+    <key>NSMicrophoneUsageDescription</key>
+    <string>HamShack++ uses USB Audio CODEC and built-in Apple Silicon soundcard inputs to decode FT8, FT4, JS8Call, and CW signals from your Xiegu G90 or HF transceiver.</string>
+    <key>NSCameraUsageDescription</key>
+    <string>HamShack++ does not access the camera.</string>
+    <key>NSBluetoothAlwaysUsageDescription</key>
+    <string>HamShack++ uses Bluetooth Low Energy to connect to MeshCore LoRa radio nodes.</string>
+    <key>NSBluetoothPeripheralUsageDescription</key>
+    <string>HamShack++ uses Bluetooth Low Energy to connect to MeshCore LoRa radio nodes.</string>
+</dict>
+</plist>
