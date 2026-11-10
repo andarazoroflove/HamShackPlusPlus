@@ -24,6 +24,7 @@
 #include <vector>
 
 #include "hamshack_platform.hpp"
+#include "AudioRouter.hpp"
 
 #ifdef _WIN32
 #include <mmsystem.h>
@@ -256,6 +257,10 @@ public:
 
     ~SoundcardEngine() {
         stop();
+    }
+
+    void attach_carbon_router(hamshack::carbon::AudioRouter* router) noexcept {
+        carbon_router_.store(router, std::memory_order_release);
     }
 
     void refresh_devices() {
@@ -694,6 +699,7 @@ private:
     std::array<uint16_t, WF_BINS> bin_fft_k_{};
     std::vector<float> time_slice_;
     std::vector<std::complex<float>> fft_scratch_;
+    std::atomic<hamshack::carbon::AudioRouter*> carbon_router_{nullptr};
 
     void push_hw_rx_lockfree(const int16_t* pcm, size_t n) {
         if (!pcm || n == 0) return;
@@ -701,13 +707,22 @@ private:
         uint64_t wr = hw_rx_write_idx_.load(std::memory_order_relaxed);
         double sum_sq = 0.0;
         float max_abs = 0.0f;
+        auto* router = carbon_router_.load(std::memory_order_acquire);
+        std::array<float, 1536> router_tap{};
+
         for (size_t i = 0; i < n; ++i) {
             float s = std::clamp((static_cast<float>(pcm[i]) * (1.0f / 32768.0f)) * gain, -1.0f, 1.0f);
             hw_rx_spsc_[(wr + i) & (HW_RX_SPSC_CAP - 1)] = s;
+            if (router && i < router_tap.size()) {
+                router_tap[i] = s;
+            }
             sum_sq += static_cast<double>(s) * s;
             max_abs = std::max(max_abs, std::fabs(s));
         }
         hw_rx_write_idx_.store(wr + n, std::memory_order_release);
+        if (router) {
+            router->push_primary_g90_samples(std::span<const float>{router_tap.data(), std::min(n, router_tap.size())});
+        }
         hw_rx_cb_atomic_.fetch_add(1, std::memory_order_relaxed);
         hw_rx_active_atomic_.store(true, std::memory_order_relaxed);
         float rms = std::sqrt(static_cast<float>(sum_sq / static_cast<double>(n)));
@@ -728,20 +743,41 @@ private:
             tx_sum_sq += static_cast<double>(s) * s;
             out_pcm[i] = static_cast<int16_t>(std::clamp(s, -1.0f, 1.0f) * 32000.0f);
         }
-        for (size_t i = avail; i < frames; ++i) {
-            out_pcm[i] = 0;
-        }
         if (avail > 0) {
+            for (size_t i = avail; i < frames; ++i) out_pcm[i] = 0;
             tx_read_idx_.store(rd + avail, std::memory_order_release);
             float rms = std::sqrt(static_cast<float>(tx_sum_sq / static_cast<double>(avail)));
             tx_rms_atomic_.store(20.0f * std::log10(std::max(1e-6f, rms)), std::memory_order_relaxed);
             bool still_more = (wr - rd) > avail;
             tx_playing_atomic_.store(still_more, std::memory_order_release);
-        } else {
-            tx_playing_atomic_.store(false, std::memory_order_release);
-            tx_rms_atomic_.store(-120.0f, std::memory_order_relaxed);
+            return avail;
         }
-        return avail;
+
+        // Zero-copy lock-free SPSC bridge for SSTV / Carbon AudioRouter TX on Source A (Xiegu G90)
+        if (auto* router = carbon_router_.load(std::memory_order_acquire)) {
+            std::array<float, 1536> rt_tx{};
+            const size_t req = std::min(frames, rt_tx.size());
+            const size_t got = router->pop_tx_for_primary_12k(std::span<float>{rt_tx.data(), req});
+            if (got > 0) {
+                for (size_t i = 0; i < got; ++i) {
+                    const float s = std::clamp(rt_tx[i], -1.0f, 1.0f);
+                    tx_sum_sq += static_cast<double>(s) * s;
+                    out_pcm[i] = static_cast<int16_t>(s * 32000.0f);
+                }
+                for (size_t i = got; i < frames; ++i) out_pcm[i] = 0;
+                const float rms = std::sqrt(static_cast<float>(tx_sum_sq / static_cast<double>(got)));
+                tx_rms_atomic_.store(20.0f * std::log10(std::max(1e-6f, rms)), std::memory_order_relaxed);
+                tx_playing_atomic_.store(router->tx_buffered_samples() > 0, std::memory_order_release);
+                return got;
+            }
+        }
+
+        for (size_t i = 0; i < frames; ++i) {
+            out_pcm[i] = 0;
+        }
+        tx_playing_atomic_.store(false, std::memory_order_release);
+        tx_rms_atomic_.store(-120.0f, std::memory_order_relaxed);
+        return 0;
     }
 
     // Must be called with `mtx` held; runs in < 3 microseconds
@@ -1039,7 +1075,8 @@ private:
     void dsp_loop() {
         uint64_t last_seen_samples = 0;
         float smoothed_noise_floor = -75.0f;
-        auto last_row_time = std::chrono::steady_clock::now();
+        bool noise_floor_seeded = false;
+        auto last_row_time = std::chrono::steady_clock::now() - std::chrono::milliseconds(350);
         int last_15s_block = -1;
 
         std::array<float, WF_BINS> raw_db{};
@@ -1104,11 +1141,16 @@ private:
                     ? static_cast<int>(std::round(100.0f + (static_cast<float>(best_bin) / WF_BINS) * 2800.0f))
                     : 0;
 
-                std::nth_element(sorted_db.begin(), sorted_db.begin() + WF_BINS * 3 / 10, sorted_db.end());
-                float noise_floor_db = sorted_db[WF_BINS * 3 / 10];
-                smoothed_noise_floor = smoothed_noise_floor * 0.92f + noise_floor_db * 0.08f;
+                std::nth_element(sorted_db.begin(), sorted_db.begin() + WF_BINS / 5, sorted_db.end());
+                float noise_floor_db = sorted_db[WF_BINS / 5];
+                if (!noise_floor_seeded) {
+                    smoothed_noise_floor = noise_floor_db;
+                    noise_floor_seeded = true;
+                } else {
+                    smoothed_noise_floor = smoothed_noise_floor * 0.90f + noise_floor_db * 0.10f;
+                }
 
-                float baseline_db = smoothed_noise_floor + 2.0f;
+                float baseline_db = smoothed_noise_floor + 0.6f;
                 constexpr float inv_dyn_range = 1.0f / 36.0f;
 
                 auto now_chrono = std::chrono::steady_clock::now();
@@ -1125,25 +1167,31 @@ private:
                     if (is_new_block) last_15s_block = cur_block;
                 }
 
-                // Step 3: Commit spectrum & optional 350ms waterfall row under `mtx` (< 3 microseconds)
+                // Step 3: Commit spectrum & peak-held 350ms waterfall row under `mtx` (< 3 microseconds)
                 {
                     std::lock_guard<std::mutex> lk(mtx);
                     peak_freq_hz = computed_peak_hz;
                     for (int b = 0; b < WF_BINS; ++b) {
                         float snr_db = raw_db[b] - baseline_db;
+                        float inst_v = 0.0f;
                         if (snr_db <= 0.0f) {
                             current_spectrum[b] = current_spectrum[b] * 0.88f;
-                            wf_row[b] = 0;
                         } else {
                             float norm = std::clamp(snr_db * inv_dyn_range, 0.0f, 1.0f);
                             // Fast polynomial approximation of pow(norm, 0.85f) accurate within 0.4% on [0,1]
                             float contrasted = norm * (1.15f - 0.15f * norm);
+                            inst_v = contrasted;
                             if (contrasted > current_spectrum[b]) {
                                 current_spectrum[b] = current_spectrum[b] * 0.35f + contrasted * 0.65f;
                             } else {
                                 current_spectrum[b] = current_spectrum[b] * 0.90f + contrasted * 0.10f;
                             }
-                            wf_row[b] = static_cast<uint8_t>(std::clamp(contrasted * 255.0f, 1.0f, 255.0f));
+                        }
+                        // Peak-hold across all 16ms FFT slices in each 350ms waterfall row interval
+                        float wf_v = std::max(inst_v, (current_spectrum[b] > 0.016f) ? (current_spectrum[b] * 0.92f) : 0.0f);
+                        if (wf_v > 0.015f) {
+                            uint8_t cand = static_cast<uint8_t>(std::clamp(wf_v * 255.0f, 1.0f, 255.0f));
+                            if (cand > wf_row[b]) wf_row[b] = cand;
                         }
                     }
                     spectrum_seq.fetch_add(1, std::memory_order_release);
@@ -1154,6 +1202,7 @@ private:
                         if (waterfall_rows.size() > WF_HISTORY) {
                             waterfall_rows.pop_back();
                         }
+                        wf_row.fill(0);
                         waterfall_seq.fetch_add(1, std::memory_order_release);
                     }
                 }

@@ -6,7 +6,7 @@
 
 <p align="center">
   <strong>Native C++20 Unified Amateur Radio Communications & Digital Mode Workstation</strong><br/>
-  <em>FLRig CAT • WSJT-X (FT8 / FT4) • JS8Call • Fldigi (CW) • ARDOP HF TNC • Pat / Winlink B2F Email • GridTracker • MeshCore++ LoRa BLE/USB • Libera.Chat IRC • Twitch Broadcast Studio</em>
+  <em>FLRig CAT • WSJT-X (FT8 / FT4) • JS8Call • Fldigi (CW) • APRS (AX.25 / Dire Wolf KISS) • SSTV (14-Mode Transceiver) • ARDOP HF TNC • Pat / Winlink B2F Email • GridTracker • MeshCore++ LoRa BLE/USB • Libera.Chat IRC • Twitch Broadcast Studio</em>
 </p>
 
 <p align="center">
@@ -22,7 +22,7 @@
 
 ## Overview
 
-**HamShack++** is a zero-dependency, native **C++20** amateur radio communications suite for **Windows x64** and **macOS Apple Silicon**. Rather than juggling half a dozen separate applications, virtual audio cables, and competing serial port bridges, HamShack++ unifies the essential digital-mode, rig-control, radio-email, mapping, and off-grid mesh programs into a single hardware-accelerated application with a persistent **FLRig / Xiegu G90 Top CAT Deck** and a **9-Tab Global Mode Bar**.
+**HamShack++** is a zero-dependency, native **C++20** amateur radio communications suite for **Windows x64** and **macOS Apple Silicon**. Rather than juggling half a dozen separate applications, virtual audio cables, and competing serial port bridges, HamShack++ unifies the essential digital-mode, rig-control, packet/APRS, slow-scan TV, radio-email, mapping, and off-grid mesh programs into a single hardware-accelerated application with a persistent **FLRig / Xiegu G90 Top CAT Deck** and an **11-Tab Global Mode Bar**.
 
 ### Pre-Built Releases
 
@@ -126,13 +126,30 @@ HamShack++ integrates and attributes the core DSP modems, protocols, and workflo
 
 ---
 
+### 11. APRS — AX.25 1200-Baud KISS-over-TCP Map & Messaging (`src/AprsEngine.hpp`, `src/AprsEngine.cpp`)
+* **Non-Blocking Dire Wolf KISS-over-TCP Bridge (`127.0.0.1:8001`)**: Dedicated background socket worker communicating via lock-free single-producer single-consumer (SPSC) queues with zero UI stalls.
+* **Native AX.25 UI Codec & APRS 1.01 Parser**: Decodes and encodes AX.25 UI frames across Uncompressed Lat/Lon, Base-91 Compressed positions, and Mic-E telemetry (Callsign, SSID, Altitude, Course, Speed, Symbol, Comment), plotting live stations directly onto the OpenStreetMap tactical map and GridTracker engine.
+* **2-Way APRS Text Messaging & Auto-ACK**: Dedicated directed `:ADDRESSEE:message{id` chat sub-panel with automatic outbound KISS `ack` generation and one-click position beacon transmission.
+
+---
+
+### 12. SSTV — 14-Mode Slow-Scan TV Transceiver & TX Studio (`src/SstvEngine.hpp`, `src/SstvEngine.cpp`, `src/AudioRouter.hpp`)
+* **14 Amateur SSTV Modes (RX & TX)**: Supports **Martin 1/2**, **Scottie 1/2**, **Robot B&W 8/12/24/36/72** (pure direct grayscale luminance), **Robot Color 12/24/36/72** (YCrCb 4:2:0 & 4:2:2), and **PD120** (`640×496` dual-line YCrCb).
+* **Zero-Allocation Hilbert FM Demodulator & Progressive Scanline Canvas**: 512-point tuning waterfall (`1000`–`2500 Hz` with `1200`/`1500`/`1900`/`2300 Hz` markers), 31-tap Blackman Analytic Hilbert FIR + quadrature FM discriminator, digital VIS auto-detection + manual mode override, automatic `1200 Hz` horizontal sync & slant tracker (`ppm`), tear-free double-buffered progressive scanline rendering, and automatic PNG capture archiving (`sstv_captures/`).
+* **48 kHz TX Modulator Studio & Atomic Dual-Source `AudioRouter`**: Atomic hot-swapping between **Source A** (Xiegu G90 HF primary stream + CAT PTT) and **Source B** (Dedicated USB Audio Dongle for BTECH APRS cable / UV-5R VOX), native `PNG/JPEG/BMP` image loader with aspect-ratio center-crop scaling, **1-bit serpentine Floyd-Steinberg dithering**, callsign/grid/RST raster text overlay, and `1.5 ms` raised-cosine anti-click envelope tapering.
+
+---
+
 ## Repository Structure
 
 ```text
 HamShackPlusPlus/
 ├── src/                        # Core HamShack++ C++20 source & platform files
 │   ├── hamshack_gui.cpp        # Main application entry point, Direct2D/AppKit renderer & MeshCore++ UI
-│   ├── hamshack_tabs.hpp       # Unified FLRig top deck & 9-mode workstation tab views
+│   ├── hamshack_tabs.hpp       # Unified FLRig top deck & 11-mode workstation tab views
+│   ├── AudioRouter.hpp/.cpp    # Carbon lock-free dual-source audio router (G90 HF & USB VHF dongle)
+│   ├── AprsEngine.hpp/.cpp     # AX.25 / APRS 1.01 KISS-over-TCP engine, map router & 2-way messaging
+│   ├── SstvEngine.hpp/.cpp     # 14-mode SSTV Hilbert FM RX decoder & 48 kHz TX modulator studio
 │   ├── hamshack_config.hpp     # Persistent station configuration & profile manager
 │   ├── hamshack_platform.hpp   # Cross-platform POSIX / Winsock2 & filesystem abstraction
 │   ├── soundcard_audio.hpp     # 12 kHz CoreAudio / WASAPI+WinMM DSP audio & FFT waterfall engine
@@ -180,3 +197,5 @@ HamShack++ stands on the shoulders of the open-source amateur radio community an
 * **[Pat Winlink](https://getpat.io/)** — Martin Hebnes Pedersen (`LA5NTA`) and the Winlink Development Team (B2F Binary Forwarding Protocol v3.2 and RMS Gateway directory integration).
 * **[GridTracker](https://gridtracker.org/)** & **[PSKReporter](https://pskreporter.info/)** — Stephen Loomis (`N0TTL`), Philip Gladstone (`N1DQ`), and the GridTracker team (Maidenhead grid visualization, QSO path arcs, and IPFIX UDP 4739 spot reporting).
 * **[MeshCore](https://meshcore.co.uk/)** — Scott Powell and the MeshCore community (LoRa companion radio protocol, BLE NUS transport, and `#hashtag` group encryption).
+* **[Dire Wolf](https://github.com/wb2osz/direwolf)** — John Langner (`WB2OSZ`) and Bob Bruninga (`WB4APR`, SK) (APRS 1.01 protocol specification, Mic-E & Base-91 telemetry formats, and AX.25 KISS-over-TCP TNC interoperability).
+* **[MMSSTV](https://hamsoft.ca/pages/mmsstv.php)** & **[QSSTV](https://www.qsl.net/on4qz/)** — Makoto Mori (`JE3HHT`), Johan Maes (`ON4QZ`), and Dayton SSTV pioneers (VIS digital header signaling and Martin, Scottie, Robot, and PD120 scanline timing standards).

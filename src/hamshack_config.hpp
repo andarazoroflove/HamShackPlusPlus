@@ -85,6 +85,15 @@ struct AppConfig {
     float wide_graph_height = 268.0f;
     int wide_graph_pos = 0;
 
+    // APRS (AX.25 1200-baud KISS-over-TCP / Dire Wolf) & SSTV Transceiver Settings
+    std::string aprs_kiss_host = "127.0.0.1";
+    int aprs_kiss_port = 8001;
+    int aprs_ssid = 9;
+    std::string aprs_digi_path = "WIDE1-1,WIDE2-1";
+    std::string aprs_beacon_comment = "HamShack++ APRS";
+    std::string sstv_overlay_text = "W1AW  FN31";
+    bool sstv_auto_save = true;
+
     static std::string get_config_dir() {
         std::string dir;
 #ifdef _WIN32
@@ -172,6 +181,13 @@ struct AppConfig {
         f << "twitch_channel=" << twitch_channel << "\n";
         f << "twitch_stream_key=" << twitch_stream_key << "\n";
         f << "twitch_rtmp_url=" << twitch_rtmp_url << "\n";
+        f << "aprs_kiss_host=" << aprs_kiss_host << "\n";
+        f << "aprs_kiss_port=" << aprs_kiss_port << "\n";
+        f << "aprs_ssid=" << aprs_ssid << "\n";
+        f << "aprs_digi_path=" << aprs_digi_path << "\n";
+        f << "aprs_beacon_comment=" << aprs_beacon_comment << "\n";
+        f << "sstv_overlay_text=" << sstv_overlay_text << "\n";
+        f << "sstv_auto_save=" << (sstv_auto_save ? 1 : 0) << "\n";
     }
 
     void load() {
@@ -267,6 +283,16 @@ struct AppConfig {
             else if (key == "wide_graph_pos") {
                 wide_graph_pos = std::clamp(std::atoi(val.c_str()), 0, 1);
             }
+            else if (key == "aprs_kiss_host" && !val.empty()) aprs_kiss_host = val;
+            else if (key == "aprs_kiss_port") {
+                int p = std::atoi(val.c_str());
+                if (p >= 1 && p <= 65535) aprs_kiss_port = p;
+            }
+            else if (key == "aprs_ssid") aprs_ssid = std::clamp(std::atoi(val.c_str()), 0, 15);
+            else if (key == "aprs_digi_path" && !val.empty()) aprs_digi_path = val;
+            else if (key == "aprs_beacon_comment") aprs_beacon_comment = val;
+            else if (key == "sstv_overlay_text") sstv_overlay_text = val;
+            else if (key == "sstv_auto_save") sstv_auto_save = (std::atoi(val.c_str()) != 0);
             else if (key.rfind("nickserv_pass:", 0) == 0) {
                 std::string n = key.substr(14);
                 if (!n.empty() && !val.empty()) {

@@ -18,6 +18,10 @@
 #include "../includes/winlink_engine.hpp"
 #include "twitch_streamer.hpp"
 #include "../includes/dxcc_lookup.hpp"
+#include "AudioRouter.hpp"
+#include "AprsEngine.hpp"
+#include "SstvEngine.hpp"
+#include <memory>
 
 namespace hamshack_ui {
 
@@ -278,7 +282,52 @@ enum HsHitId : int {
     HS_TWITCH_DASHBOARD_WEB = 1722,
     HS_TWITCH_CHANNEL_BOX   = 1723,
     HS_TWITCH_KEY_BOX       = 1724,
-    HS_TWITCH_SAVE_BTN      = 1725
+    HS_TWITCH_SAVE_BTN      = 1725,
+
+    // Carbon Engine Tabs: APRS (Tab 9) & SSTV (Tab 10) + Lock-Free AudioRouter Dropdown
+    HS_TAB_APRS             = 1810,
+    HS_TAB_SSTV             = 1811,
+    HS_AUDIO_SRC_DROPDOWN   = 1812,
+    HS_AUDIO_SRC_OPT_G90    = 1813,
+    HS_AUDIO_SRC_OPT_DONGLE = 1814,
+    HS_AUDIO_DONGLE_CYCLE   = 1815,
+
+    // APRS Tab Controls (AX.25 1200-baud KISS-over-TCP / Dire Wolf + Map + 2-Way Messaging)
+    HS_APRS_HOST_BOX        = 1820,
+    HS_APRS_PORT_BOX        = 1821,
+    HS_APRS_SSID_CYCLE      = 1822,
+    HS_APRS_PATH_BOX        = 1823,
+    HS_APRS_COMMENT_BOX     = 1824,
+    HS_APRS_CONNECT_TOG     = 1825,
+    HS_APRS_BEACON_TX       = 1826,
+    HS_APRS_MSG_TO_BOX      = 1827,
+    HS_APRS_MSG_TEXT_BOX    = 1828,
+    HS_APRS_MSG_SEND        = 1829,
+    HS_APRS_CLEAR_BTN       = 1830,
+    HS_APRS_STATION_ROW     = 1831,
+
+    // SSTV Tab Controls (14-Mode RX Demodulator + Phase-Continuous 48 kHz TX Studio)
+    HS_SSTV_AUTO_VIS_TOG    = 1850,
+    HS_SSTV_RX_MODE_PREV    = 1851,
+    HS_SSTV_RX_MODE_NEXT    = 1852,
+    HS_SSTV_FORCE_RX        = 1853,
+    HS_SSTV_SLANT_M10       = 1854,
+    HS_SSTV_SLANT_M1        = 1855,
+    HS_SSTV_SLANT_ZERO      = 1856,
+    HS_SSTV_SLANT_P1        = 1857,
+    HS_SSTV_SLANT_P10       = 1858,
+    HS_SSTV_CLEAR_RX        = 1859,
+    HS_SSTV_AUTOSAVE_TOG    = 1860,
+    HS_SSTV_SAVE_NOW        = 1861,
+    HS_SSTV_VIEW_CYCLE      = 1862,
+    HS_SSTV_TX_MODE_PREV    = 1863,
+    HS_SSTV_TX_MODE_NEXT    = 1864,
+    HS_SSTV_LOAD_IMG        = 1865,
+    HS_SSTV_TEST_CARD       = 1866,
+    HS_SSTV_DITHER_TOG      = 1867,
+    HS_SSTV_OVERLAY_BOX     = 1868,
+    HS_SSTV_SEND_TX         = 1869,
+    HS_SSTV_ABORT_TX        = 1870
 };
 
 enum class HsTextFocus : int {
@@ -310,7 +359,14 @@ enum class HsTextFocus : int {
     LogQsoPwr  = 25,
     LogQsoComm = 26,
     TwitchChannel = 27,
-    TwitchStreamKey = 28
+    TwitchStreamKey = 28,
+    AprsHost = 29,
+    AprsPort = 30,
+    AprsPath = 31,
+    AprsComment = 32,
+    AprsMsgTo = 33,
+    AprsMsgText = 34,
+    SstvOverlay = 35
 };
 
 using LogQsoDialogState = hamshack::LogQsoDialogState;
@@ -330,9 +386,13 @@ struct HamShackSuite {
     cw_fldigi::CWModemEngine cw;
     hamshack::IrcClientEngine irc;
     winlink::WinlinkEngine winlink;
+    std::unique_ptr<hamshack::carbon::AudioRouter> audio_router;
+    std::unique_ptr<hamshack::carbon::AprsEngine> aprs;
+    std::unique_ptr<hamshack::carbon::SstvEngine> sstv;
 
     // 0 = FT8/FT4 (WSJT-X), 1 = JS8Call, 2 = CW (Fldigi), 3 = MeshCore++ (BLE/LoRa),
-    // 4 = Grid Tracker, 5 = Pages, 6 = IRC, 7 = Winlink/Email, 8 = Configuration
+    // 4 = Grid Tracker, 5 = Pages, 6 = IRC, 7 = Winlink/Email, 8 = Configuration,
+    // 9 = APRS (KISS/AX.25), 10 = SSTV (14-Mode Transceiver)
     int active_mode_tab = 0;
     // Pages Sub-Tab: 0 = QRZ, 1 = pskreporter.info, 2 = hf.dxview.org, 3 = dxlook.com, 4 = openhamclock.com
     int active_page_subtab = 0;
@@ -390,6 +450,25 @@ struct HamShackSuite {
     double gt_map_drag_ny = 0.36;
     D2D1_RECT_F gt_map_rect{0, 0, 0, 0};
 
+    // Carbon Engine UI State (Decoupled from APRS & SSTV worker threads)
+    bool audio_source_dropdown_open = false;
+    D2D1_RECT_F audio_source_dropdown_anchor{0, 0, 0, 0};
+
+    std::string aprs_host_edit = "127.0.0.1";
+    std::string aprs_port_edit = "8001";
+    int aprs_ssid = 9;
+    std::string aprs_path_edit = "WIDE1-1,WIDE2-1";
+    std::string aprs_comment_edit = "HamShack++ APRS";
+    std::string aprs_msg_to_edit;
+    std::string aprs_msg_text_edit;
+    std::string aprs_selected_call;
+    std::string aprs_status_banner = "Ready — Connect to Dire Wolf KISS TCP (127.0.0.1:8001)";
+
+    int sstv_canvas_layout = 0; // 0 = Split RX + TX Preview, 1 = Full RX Scanline, 2 = Full TX Studio
+    hamshack::carbon::SstvMode sstv_manual_mode = hamshack::carbon::SstvMode::Martin1;
+    std::string sstv_overlay_edit = "W1AW  FN31";
+    std::string sstv_status_banner = "Ready — Auto VIS Armed (14 Modes: Scottie, Martin, Robot B&W/Color, PD120)";
+
     std::vector<HsHitRect> hits;
 
     HamShackSuite() {
@@ -423,8 +502,28 @@ struct HamShackSuite {
             winlink.selected_gateway_freq = cfg.winlink_selected_freq;
             winlink.selected_gateway_mode = cfg.winlink_selected_mode;
         }
+
+        // Initialize Carbon Engine lock-free AudioRouter, APRS KISS/AX.25 Engine, and 14-Mode SSTV Transceiver
+        audio_router = std::make_unique<hamshack::carbon::AudioRouter>();
+        aprs = std::make_unique<hamshack::carbon::AprsEngine>();
+        sstv = std::make_unique<hamshack::carbon::SstvEngine>(*audio_router);
+        soundcard.attach_carbon_router(audio_router.get());
+
+        aprs_host_edit = cfg.aprs_kiss_host.empty() ? "127.0.0.1" : cfg.aprs_kiss_host;
+        aprs_port_edit = std::to_string(cfg.aprs_kiss_port > 0 ? cfg.aprs_kiss_port : 8001);
+        aprs_ssid = std::clamp(cfg.aprs_ssid, 0, 15);
+        aprs_path_edit = cfg.aprs_digi_path.empty() ? "WIDE1-1,WIDE2-1" : cfg.aprs_digi_path;
+        aprs_comment_edit = cfg.aprs_beacon_comment.empty() ? "HamShack++ APRS" : cfg.aprs_beacon_comment;
+        aprs->set_station_identity(hf_callsign, static_cast<uint8_t>(aprs_ssid), aprs_path_edit);
+        aprs->set_kiss_endpoint(aprs_host_edit, static_cast<uint16_t>(std::clamp(cfg.aprs_kiss_port > 0 ? cfg.aprs_kiss_port : 8001, 1, 65535)));
+
+        sstv_overlay_edit = cfg.sstv_overlay_text.empty() ? (hf_callsign + "  " + hf_grid) : cfg.sstv_overlay_text;
+        sstv->set_auto_save_png(cfg.sstv_auto_save);
+        sstv->set_tx_overlay_text(sstv_overlay_edit);
+
         flrig.start();
         soundcard.start();
+        sstv->start_worker();
         winlink.set_radio_interfaces(&flrig, &soundcard);
         ft8.my_call = hf_callsign;
         ft8.my_grid = hf_grid;
@@ -454,6 +553,10 @@ struct HamShackSuite {
     }
 
     ~HamShackSuite() {
+        if (aprs) aprs->disconnect_kiss();
+        if (sstv) sstv->stop_worker();
+        soundcard.attach_carbon_router(nullptr);
+        if (audio_router) audio_router->stop_usb_dongle_stream();
         irc.disconnect();
         soundcard.stop();
         flrig.stop();
@@ -464,10 +567,12 @@ struct HamShackSuite {
         if (hamshack::Ft8Ft4Engine::grid_to_latlon(hf_grid, lat, lon)) {
             gt_map_nx = (lon + 180.0) / 360.0;
             double r_lat = std::clamp(lat, -85.0, 85.0) * 3.14159265358979323846 / 180.0;
-            gt_map_ny = (1.0 - std::log(std::tan(r_lat) + 1.0 / std::cos(r_lat)) / 3.14159265358979323846) / 2.0;
+            gt_map_ny = (1.0 - std::log(std::tan(rlat_clamp(r_lat)) + 1.0 / std::cos(rlat_clamp(r_lat))) / 3.14159265358979323846) / 2.0;
         }
         gt_map_zoom = std::clamp(zoom_lvl, 2, 10);
     }
+
+    static double rlat_clamp(double r_lat) noexcept { return r_lat; }
 
     void add_hit(const D2D1_RECT_F& r, int id, int idx = 0, const std::string& payload = "") {
         hits.push_back({r, id, idx, payload});
@@ -492,12 +597,16 @@ struct HamShackSuite {
             std::lock_guard<std::mutex> lk(cw.mtx);
             cw.my_call = hf_callsign;
         }
+        if (aprs) {
+            aprs->set_station_identity(hf_callsign, static_cast<uint8_t>(aprs_ssid), aprs_path_edit);
+        }
     }
 
     void switch_mode_tab(int tab_idx) {
-        int target = std::clamp(tab_idx, 0, 8);
+        int target = std::clamp(tab_idx, 0, 10);
         if (active_mode_tab == target) return;
         active_mode_tab = target;
+        audio_source_dropdown_open = false;
         text_focus = HsTextFocus::None;
         auto& cfg = hamshack::get_app_config();
         cfg.last_main_tab = active_mode_tab;
@@ -557,17 +666,40 @@ struct HamShackSuite {
         if (soundcard.is_tx_active()) {
             want_ptt = true;
         }
-        if (want_ptt != flrig.ptt_active && (ft8.tx_enabled || ft8.tune_active || js8.tx_active || cw.tx_active)) {
+        const bool sstv_hf_tx = sstv && audio_router &&
+                                sstv->telemetry().tx_active &&
+                                audio_router->active_source() == hamshack::carbon::AudioSource::PrimaryG90;
+        if (sstv_hf_tx) {
+            want_ptt = true;
+        }
+        if (want_ptt != flrig.ptt_active &&
+            (ft8.tx_enabled || ft8.tune_active || js8.tx_active || cw.tx_active || sstv_hf_tx || sstv_was_ptt_)) {
             flrig.set_ptt(want_ptt);
             if (!want_ptt) {
                 js8.tx_active = false;
                 cw.tx_active = false;
             }
         }
+        sstv_was_ptt_ = sstv_hf_tx;
+
+        // Drain lock-free APRS events into decoupled GUI-owned tables & shared Map Engine
+        if (aprs) {
+            size_t n_ev = aprs->poll_ui_events([this](const hamshack::carbon::AprsStationEntry& st) {
+                aprs_status_banner = "GPS Tracked: " + st.callsign_ssid + " (" + st.last_utc + ")";
+            });
+            if (n_ev == 0 && aprs->is_running()) {
+                if (aprs->is_connected()) {
+                    if (aprs_status_banner.rfind("Ready", 0) == 0 || aprs_status_banner.rfind("Connecting", 0) == 0) {
+                        aprs_status_banner = "Connected to KISS TNC (" + aprs->host() + ":" + std::to_string(aprs->port()) + ")";
+                    }
+                }
+            }
+        }
     }
 
 private:
     uint64_t last_cw_chunk_ms_ = 0;
+    bool sstv_was_ptt_ = false;
 };
 
 // Map waterfall intensity (0..255) to 5 selectable high-contrast color palettes (Requirement 5)
@@ -1108,7 +1240,12 @@ inline void render_waterfall_widget(RendererT& r, HamShackSuite& hs, POINT mouse
         heat_lut_f[iv] = waterfall_heat_color(static_cast<uint8_t>(iv), r.light_mode, cur_scheme);
     }
 
-    const bool need_wf_upload = (cur_wf_seq != 0) && !r.is_waterfall_cache_valid(cur_wf_seq, cur_scheme);
+#ifdef __APPLE__
+    const int tex_w = std::clamp(static_cast<int>(std::round(plot_w * 2.0f)), 480, BINS);
+#else
+    const int tex_w = std::clamp(static_cast<int>(std::round(plot_w)), 360, BINS);
+#endif
+    const bool need_wf_upload = (cur_wf_seq != 0) && !r.is_waterfall_cache_valid(cur_wf_seq, cur_scheme, tex_w);
     {
         std::lock_guard<std::mutex> lk(hs.soundcard.mtx);
         spec = hs.soundcard.current_spectrum;
@@ -1122,37 +1259,38 @@ inline void render_waterfall_widget(RendererT& r, HamShackSuite& hs, POINT mouse
                 uint8_t cr = static_cast<uint8_t>(std::clamp(c.r, 0.0f, 1.0f) * 255.0f + 0.5f);
                 uint8_t cg = static_cast<uint8_t>(std::clamp(c.g, 0.0f, 1.0f) * 255.0f + 0.5f);
                 uint8_t cb = static_cast<uint8_t>(std::clamp(c.b, 0.0f, 1.0f) * 255.0f + 0.5f);
-#ifdef _WIN32
+                // Unified premultiplied BGRA32 layout for both Direct2D and CoreGraphics (2u | (2u << 12))
                 packed_lut[iv][0] = cb;
                 packed_lut[iv][1] = cg;
                 packed_lut[iv][2] = cr;
                 packed_lut[iv][3] = 255;
-#else
-                packed_lut[iv][0] = cr;
-                packed_lut[iv][1] = cg;
-                packed_lut[iv][2] = cb;
-                packed_lut[iv][3] = 255;
-#endif
             }
 
-            const size_t req_bytes = static_cast<size_t>(std::max(1, n_rows)) * BINS * 4;
+            const size_t req_bytes = static_cast<size_t>(std::max(1, n_rows)) * static_cast<size_t>(tex_w) * 4u;
             if (r.wf_pixel_bytes.size() < req_bytes) {
-                r.wf_pixel_bytes.resize(static_cast<size_t>(300) * BINS * 4, 0);
+                r.wf_pixel_bytes.resize(static_cast<size_t>(300) * BINS * 4u, 0);
             }
             r.wf_intervals.clear();
 
             for (int ri = 0; ri < n_rows; ++ri) {
                 const auto& src_row = hs.soundcard.waterfall_rows[ri];
-                uint8_t* dst_row = r.wf_pixel_bytes.data() + static_cast<size_t>(ri) * BINS * 4;
+                uint8_t* dst_row = r.wf_pixel_bytes.data() + static_cast<size_t>(ri) * static_cast<size_t>(tex_w) * 4u;
                 const uint8_t* bins_ptr = src_row.bins.data();
-                for (int b = 0; b < BINS; ++b) {
-                    std::memcpy(dst_row + b * 4, packed_lut[bins_ptr[b]], 4);
+                // Horizontal max-pooling across [b0, b1) preserves every narrowband CW/FT8/JS8 tone without dilution
+                for (int cx = 0; cx < tex_w; ++cx) {
+                    const int b0 = (cx * BINS) / tex_w;
+                    const int b1 = std::max(b0 + 1, ((cx + 1) * BINS) / tex_w);
+                    uint8_t pk = 0;
+                    for (int b = b0; b < b1; ++b) {
+                        if (bins_ptr[b] > pk) pk = bins_ptr[b];
+                    }
+                    std::memcpy(dst_row + cx * 4, packed_lut[pk], 4);
                 }
                 if (src_row.is_interval_start) {
                     r.wf_intervals.push_back({ri, src_row.band_label.empty() ? hs.current_band_label() : src_row.band_label});
                 }
             }
-            r.update_waterfall_texture(BINS, n_rows, r.wf_pixel_bytes.data(), cur_wf_seq, cur_scheme);
+            r.update_waterfall_texture(tex_w, n_rows, r.wf_pixel_bytes.data(), cur_wf_seq, cur_scheme);
         }
     }
 
@@ -1178,8 +1316,8 @@ inline void render_waterfall_widget(RendererT& r, HamShackSuite& hs, POINT mouse
     }
 
     // Render Waterfall via 1 single GPU DrawBitmap call + crisp vector 15-second interval lines
-    if (r.wf_tex_rows > 0) {
-        r.draw_waterfall_texture(plot_x, wf_y, plot_w, wf_h, BINS);
+    if (r.wf_tex_rows > 0 && r.wf_tex_width > 0) {
+        r.draw_waterfall_texture(plot_x, wf_y, plot_w, wf_h, r.wf_tex_width);
         float row_h = wf_h / static_cast<float>(std::max(16, r.wf_tex_rows));
         for (const auto& ivm : r.wf_intervals) {
             float ry = wf_y + ivm.row_idx * row_h;
@@ -1629,20 +1767,22 @@ inline void render_global_bottom_tab_bar(RendererT& r, AppT& app, HamShackSuite&
         const char* label;
         uint32_t color;
     };
-    static constexpr GlobalTabSpec kGlobalTabs[9] = {
-        {HS_TAB_FT8,    0, "FT8 / FT4",     0x00E5FF},
-        {HS_TAB_JS8,    1, "JS8Call",       0x10B981},
-        {HS_TAB_CW,     2, "CW Keyer",      0xFBBF24},
-        {HS_TAB_MESH,   3, "MeshCore",      0xA855F7},
-        {HS_TAB_GT,     4, "Grid Tracker",  0xF59E0B},
-        {HS_TAB_PAGES,  5, "Pages",         0x38BDF8},
-        {HS_TAB_IRC,    6, "IRC",           0xEC4899},
-        {HS_TAB_WINLINK,7, "Winlink",       0x34D399},
-        {HS_TAB_CONFIG, 8, "Configuration", 0x94A3B8}
+    static constexpr GlobalTabSpec kGlobalTabs[11] = {
+        {HS_TAB_FT8,    0,  "FT8 / FT4",     0x00E5FF},
+        {HS_TAB_JS8,    1,  "JS8Call",       0x10B981},
+        {HS_TAB_CW,     2,  "CW Keyer",      0xFBBF24},
+        {HS_TAB_APRS,   9,  "APRS",          0x22D3EE},
+        {HS_TAB_SSTV,   10, "SSTV",          0xF472B6},
+        {HS_TAB_MESH,   3,  "MeshCore",      0xA855F7},
+        {HS_TAB_GT,     4,  "Grid Tracker",  0xF59E0B},
+        {HS_TAB_PAGES,  5,  "Pages",         0x38BDF8},
+        {HS_TAB_IRC,    6,  "IRC",           0xEC4899},
+        {HS_TAB_WINLINK,7,  "Winlink",       0x34D399},
+        {HS_TAB_CONFIG, 8,  "Configuration", 0x94A3B8}
     };
 
-    float tab_w = std::min(150.0f, (W - 20.0f - 8 * 4.0f) / 9.0f);
-    for (int i = 0; i < 9; ++i) {
+    float tab_w = std::min(134.0f, (W - 20.0f - 10 * 4.0f) / 11.0f);
+    for (int i = 0; i < 11; ++i) {
         float tx = 10.0f + i * (tab_w + 4.0f);
         D2D1_RECT_F tr = D2D1::RectF(tx, bar_y, tx + tab_w, bar_y + bar_h);
         bool sel = (hs.active_mode_tab == kGlobalTabs[i].idx);
@@ -2612,6 +2752,18 @@ inline void render_gridtracker_workspace(RendererT& r, AppT& app, HamShackSuite&
                     r.fill_round_rect(D2D1::RectF(pt.x - 4, pt.y - 4, pt.x + 4, pt.y + 4), 4.0f, r.hex_color(col));
                     r.draw_text(c_out + (wkd ? " [W]" : ""), r.font_mono_small,
                                 D2D1::RectF(pt.x + 6, pt.y - 8, pt.x + 100, pt.y + 8), r.hex_color(col));
+                }
+            }
+            // Forwarded APRS GPS Tracker Stations (from AprsEngine)
+            if (hs.aprs) {
+                for (const auto& st : hs.aprs->stations()) {
+                    if (!st.has_position) continue;
+                    D2D1_POINT_2F pt = geo_pt(st.latitude, st.longitude);
+                    r.fill_round_rect(D2D1::RectF(pt.x - 5, pt.y - 5, pt.x + 5, pt.y + 5), 5.0f, r.hex_color(0x22D3EE));
+                    r.draw_round_rect(D2D1::RectF(pt.x - 6, pt.y - 6, pt.x + 6, pt.y + 6), 6.0f, r.hex_color(0x020617), 1.2f);
+                    std::string lbl = st.callsign_ssid + " [APRS]";
+                    r.draw_text(lbl, r.font_mono_small,
+                                D2D1::RectF(pt.x + 7, pt.y - 9, pt.x + 150, pt.y + 9), r.hex_color(0x22D3EE));
                 }
             }
         }
@@ -4136,10 +4288,820 @@ inline void render_log_qso_modal(RendererT& r, HamShackSuite& hs, POINT mouse_pt
 }
 
 // ============================================================================
+// Shared Carbon Engine Audio Source Dropdown Widget (Source A: G90 vs Source B: USB Dongle)
+// ============================================================================
+template <typename RendererT>
+inline void render_carbon_audio_source_bar(RendererT& r, HamShackSuite& hs, POINT mouse_pt,
+                                           float x, float y, float drop_w) {
+    const auto active_src = hs.audio_router
+        ? hs.audio_router->active_source()
+        : hamshack::carbon::AudioSource::PrimaryG90;
+    const bool is_dongle = (active_src == hamshack::carbon::AudioSource::UsbDongleVhf);
+
+    std::string drop_lbl = is_dongle
+        ? "\xf0\x9f\x8e\xa7 Audio: Source B — USB Dongle (UV-5R / BTECH) \xe2\x96\xbe"
+        : "\xf0\x9f\x93\xbb Audio: Source A — Xiegu G90 HF Stream \xe2\x96\xbe";
+    D2D1_RECT_F drop_rc = D2D1::RectF(x, y, x + drop_w, y + 26.0f);
+    hs.audio_source_dropdown_anchor = drop_rc;
+    draw_hs_btn(r, hs, mouse_pt, x, y, drop_w, 26.0f, HS_AUDIO_SRC_DROPDOWN,
+                drop_lbl, hs.audio_source_dropdown_open || is_dongle,
+                is_dongle ? 0x22D3EE : 0x00E5FF, 0, "", true);
+
+    if (hs.audio_router) {
+        const auto rt_tel = hs.audio_router->telemetry();
+        std::string dev_name(hs.audio_router->selected_dongle_name());
+        if (dev_name.size() > 22) dev_name = dev_name.substr(0, 22) + "..";
+        std::string hw_lbl = "USB HW: " + dev_name;
+        draw_hs_btn(r, hs, mouse_pt, x + drop_w + 5.0f, y, 185.0f, 26.0f, HS_AUDIO_DONGLE_CYCLE,
+                    hw_lbl, is_dongle && rt_tel.dongle_stream_active, 0x10B981, 0, "", true);
+    }
+}
+
+template <typename RendererT>
+inline void render_carbon_audio_dropdown_overlay(RendererT& r, HamShackSuite& hs, POINT mouse_pt) {
+    if (!hs.audio_source_dropdown_open || !hs.audio_router) return;
+    const float mx = hs.audio_source_dropdown_anchor.left;
+    const float my = hs.audio_source_dropdown_anchor.bottom + 3.0f;
+    const float mw = std::max(380.0f, hs.audio_source_dropdown_anchor.right - hs.audio_source_dropdown_anchor.left + 80.0f);
+    const float mh = 90.0f;
+
+    D2D1_RECT_F menu = D2D1::RectF(mx, my, mx + mw, my + mh);
+    r.fill_round_rect(menu, 7.0f, r.hex_color(0x0B111E, 0.98f));
+    r.draw_round_rect(menu, 7.0f, r.hex_color(0x00E5FF), 1.6f);
+    r.draw_text("SELECT ATOMIC LOCK-FREE AUDIO ROUTER STREAM", r.font_small,
+                D2D1::RectF(mx + 10.0f, my + 4.0f, mx + mw - 10.0f, my + 22.0f), r.hex_color(0x38BDF8));
+
+    const auto cur = hs.audio_router->active_source();
+    draw_hs_btn(r, hs, mouse_pt, mx + 8.0f, my + 25.0f, mw - 16.0f, 27.0f, HS_AUDIO_SRC_OPT_G90,
+                "Source A: Xiegu G90 Primary HF Stream (Zero-Copy Shared Tap + CAT PTT)",
+                cur == hamshack::carbon::AudioSource::PrimaryG90, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, mx + 8.0f, my + 56.0f, mw - 16.0f, 27.0f, HS_AUDIO_SRC_OPT_DONGLE,
+                "Source B: Dedicated USB Audio Dongle (BTECH APRS Cable / UV-5R VOX)",
+                cur == hamshack::carbon::AudioSource::UsbDongleVhf, 0x22D3EE, 0, "", true);
+}
+
+// ============================================================================
+// TAB 9: APRS — AX.25 1200-Baud KISS-over-TCP (Dire Wolf), OSM Map & Messaging
+// ============================================================================
+template <typename RendererT, typename AppT>
+inline void render_aprs_workspace(RendererT& r, AppT& /*app*/, HamShackSuite& hs, POINT mouse_pt,
+                                  float x, float y, float w, float h) {
+    if (!hs.aprs) return;
+
+    // 1. Top Control Strip (AudioRouter Dropdown + Dire Wolf KISS TCP + Beacon TX)
+    const float bar_h = 34.0f;
+    D2D1_RECT_F bar_r = D2D1::RectF(x, y, x + w, y + bar_h);
+    r.fill_round_rect(bar_r, 6.0f, r.hex_color(0x0A0F1D));
+    r.draw_round_rect(bar_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
+
+    float cx = x + 6.0f;
+    render_carbon_audio_source_bar(r, hs, mouse_pt, cx, y + 4.0f, 285.0f);
+    cx += 285.0f + 5.0f + 185.0f + 10.0f;
+
+    auto draw_aprs_field = [&](float fx, float fw, const std::string& prefix, const std::string& val,
+                               HsTextFocus foc, int hit_id) {
+        D2D1_RECT_F rc = D2D1::RectF(fx, y + 4.0f, fx + fw, y + 30.0f);
+        bool active = (hs.text_focus == foc);
+        r.fill_round_rect(rc, 4.0f, r.hex_color(active ? 0x16243D : 0x05080F));
+        r.draw_round_rect(rc, 4.0f, r.hex_color(active ? 0x00E5FF : 0x334155), active ? 1.5f : 1.0f);
+        std::string txt = prefix + val + (active ? "|" : "");
+        r.draw_text(txt, r.font_mono_small, D2D1::RectF(rc.left + 6.0f, rc.top + 2.0f, rc.right - 4.0f, rc.bottom - 2.0f),
+                    r.hex_color(active ? 0x00E5FF : 0xE2E8F0));
+        hs.add_hit(rc, hit_id);
+    };
+
+    draw_aprs_field(cx, 152.0f, "KISS: ", hs.aprs_host_edit, HsTextFocus::AprsHost, HS_APRS_HOST_BOX);
+    cx += 156.0f;
+    draw_aprs_field(cx, 78.0f, ":", hs.aprs_port_edit, HsTextFocus::AprsPort, HS_APRS_PORT_BOX);
+    cx += 82.0f;
+
+    draw_hs_btn(r, hs, mouse_pt, cx, y + 4.0f, 68.0f, 26.0f, HS_APRS_SSID_CYCLE,
+                "-" + std::to_string(hs.aprs_ssid), false, 0xFBBF24, 0, "", true);
+    cx += 72.0f;
+
+    if (w > 1280.0f) {
+        draw_aprs_field(cx, 158.0f, "Path: ", hs.aprs_path_edit, HsTextFocus::AprsPath, HS_APRS_PATH_BOX);
+        cx += 162.0f;
+    }
+
+    const bool kiss_conn = hs.aprs->is_connected();
+    const bool kiss_active = hs.aprs->is_running();
+    std::string conn_lbl = kiss_conn ? "\xe2\x97\x8f KISS ONLINE"
+                         : kiss_active ? "\xe2\x97\x8b CONNECTING.."
+                                       : "Connect KISS";
+    draw_hs_btn(r, hs, mouse_pt, cx, y + 4.0f, 112.0f, 26.0f, HS_APRS_CONNECT_TOG,
+                conn_lbl, kiss_active, kiss_conn ? 0x10B981 : 0x38BDF8, 0, "", true);
+    cx += 116.0f;
+
+    draw_hs_btn(r, hs, mouse_pt, cx, y + 4.0f, 98.0f, 26.0f, HS_APRS_BEACON_TX,
+                "\xf0\x9f\x93\xa1 Beacon TX", false, 0xF59E0B, 0, "", true);
+    cx += 102.0f;
+
+    if (cx + 58.0f <= x + w - 4.0f) {
+        draw_hs_btn(r, hs, mouse_pt, x + w - 62.0f, y + 4.0f, 56.0f, 26.0f, HS_APRS_CLEAR_BTN,
+                    "Clear", false, 0xEF4444, 0, "", true);
+    }
+
+    // 2. Main Split Workspace: Left (Map + AX.25 Packet Log) | Right (Heard Stations + 2-Way APRS Messaging)
+    const float body_y = y + bar_h + 6.0f;
+    const float body_h = std::max(120.0f, h - bar_h - 6.0f);
+    const float right_w = std::clamp(w * 0.34f, 340.0f, 470.0f);
+    const float left_w = std::max(320.0f, w - right_w - 8.0f);
+    const float log_h = std::clamp(body_h * 0.33f, 145.0f, 240.0f);
+    const float map_h = std::max(140.0f, body_h - log_h - 6.0f);
+
+    // ---- 2A. Interactive APRS OpenStreetMap Surface ----
+    D2D1_RECT_F map_r = D2D1::RectF(x, body_y, x + left_w, body_y + map_h);
+    hs.gt_map_rect = map_r;
+    hs.add_hit(map_r, HS_GT_MAP_CANVAS);
+
+    r.fill_round_rect(map_r, 8.0f, r.hex_color(0x0A0F1D));
+    r.draw_round_rect(map_r, 8.0f, r.hex_color(0x1E293B), 1.2f);
+    r.rt->PushAxisAlignedClip(map_r, D2D1_ANTIALIAS_MODE_ALIASED);
+
+    const int z = hs.gt_map_zoom;
+    const int n_tiles = 1 << z;
+    const double ws = 256.0 * n_tiles;
+    const double mcx = (map_r.left + map_r.right) * 0.5;
+    const double mcy = (map_r.top + map_r.bottom) * 0.5;
+    const double cam_x = hs.gt_map_nx * ws;
+    const double cam_y = hs.gt_map_ny * ws;
+
+    auto to_screen = [&](double nx, double ny) -> D2D1_POINT_2F {
+        double dx = nx - hs.gt_map_nx;
+        if (dx > 0.5) dx -= 1.0;
+        else if (dx < -0.5) dx += 1.0;
+        return D2D1::Point2F(static_cast<float>(mcx + dx * ws),
+                             static_cast<float>(mcy + (ny - hs.gt_map_ny) * ws));
+    };
+    auto geo_pt = [&](double lat, double lon) -> D2D1_POINT_2F {
+        return to_screen(lon_to_nx(lon), lat_to_ny(lat));
+    };
+
+    int tx0 = static_cast<int>(std::floor((cam_x - (mcx - map_r.left)) / 256.0));
+    int tx1 = static_cast<int>(std::floor((cam_x + (map_r.right - mcx)) / 256.0));
+    int ty0 = std::max(0, static_cast<int>(std::floor((cam_y - (mcy - map_r.top)) / 256.0)));
+    int ty1 = std::min(n_tiles - 1, static_cast<int>(std::floor((cam_y + (map_r.bottom - mcy)) / 256.0)));
+
+    for (int ty = ty0; ty <= ty1; ++ty) {
+        for (int tx = tx0; tx <= tx1; ++tx) {
+            int wx_tile = ((tx % n_tiles) + n_tiles) % n_tiles;
+            float sx = static_cast<float>(mcx + tx * 256.0 - cam_x);
+            float sy = static_cast<float>(mcy + ty * 256.0 - cam_y);
+            D2D1_RECT_F dst = D2D1::RectF(sx, sy, sx + 256.0f, sy + 256.0f);
+            if (ID2D1Bitmap* bmp = r.get_tile(tile_key(0, z, wx_tile, ty))) {
+                r.rt->DrawBitmap(bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR);
+                continue;
+            }
+            g_tiles.request(0, z, wx_tile, ty);
+            for (int up = 1; up <= 6 && z - up >= 0; ++up) {
+                auto it = r.tile_bitmaps.find(tile_key(0, z - up, wx_tile >> up, ty >> up));
+                if (it == r.tile_bitmaps.end()) continue;
+                it->second.last_used = r.frame_no;
+                float sub = 256.0f / static_cast<float>(1 << up);
+                float ox = static_cast<float>(wx_tile & ((1 << up) - 1)) * sub;
+                float oy = static_cast<float>(ty & ((1 << up) - 1)) * sub;
+                D2D1_RECT_F src = D2D1::RectF(ox, oy, ox + sub, oy + sub);
+                r.rt->DrawBitmap(it->second.bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+                break;
+            }
+        }
+    }
+    if (!r.light_mode) {
+        r.fill_rect(map_r, r.hex_color(0x0B1220, 0.50f));
+    }
+
+    // Home Station QTH Pin
+    double qlat = 0.0, qlon = 0.0;
+    if (hamshack::Ft8Ft4Engine::grid_to_latlon(hs.hf_grid, qlat, qlon)) {
+        D2D1_POINT_2F qpt = geo_pt(qlat, qlon);
+        r.fill_round_rect(D2D1::RectF(qpt.x - 5.0f, qpt.y - 5.0f, qpt.x + 5.0f, qpt.y + 5.0f), 5.0f, r.hex_color(0xF97316));
+        std::string my_aprs = hs.hf_callsign + (hs.aprs_ssid > 0 ? ("-" + std::to_string(hs.aprs_ssid)) : "");
+        r.draw_text("\xe2\x98\x85 " + my_aprs + " [QTH]", r.font_ui_bold,
+                    D2D1::RectF(qpt.x + 8.0f, qpt.y - 10.0f, qpt.x + 190.0f, qpt.y + 10.0f), r.hex_color(0xFBBF24));
+    }
+
+    // Decoded APRS GPS Station Pins + Heading Vector
+    const auto& aprs_stations = hs.aprs->stations();
+    const auto& aprs_packets  = hs.aprs->packet_log();
+    const auto& aprs_chats    = hs.aprs->chat_log();
+    size_t gps_count = 0;
+    for (const auto& st_rec : aprs_stations) {
+        if (!st_rec.has_position) continue;
+        ++gps_count;
+        D2D1_POINT_2F pt = geo_pt(st_rec.latitude, st_rec.longitude);
+        if (pt.x < map_r.left - 30.0f || pt.x > map_r.right + 30.0f ||
+            pt.y < map_r.top - 30.0f || pt.y > map_r.bottom + 30.0f) {
+            continue;
+        }
+        bool is_sel = (!hs.aprs_selected_call.empty() && hs.aprs_selected_call == st_rec.callsign_ssid);
+        uint32_t pcol = is_sel ? 0xFBBF24 : 0x22D3EE;
+        if (st_rec.speed_knots >= 1.0f) {
+            float rad = st_rec.course_deg * 3.14159265f / 180.0f;
+            D2D1_POINT_2F tip = D2D1::Point2F(pt.x + std::sin(rad) * 16.0f, pt.y - std::cos(rad) * 16.0f);
+            r.draw_line(pt, tip, r.hex_color(0x10B981, 0.9f), 2.0f);
+        }
+        r.fill_round_rect(D2D1::RectF(pt.x - 5.5f, pt.y - 5.5f, pt.x + 5.5f, pt.y + 5.5f), 5.5f, r.hex_color(pcol));
+        r.draw_round_rect(D2D1::RectF(pt.x - 6.5f, pt.y - 6.5f, pt.x + 6.5f, pt.y + 6.5f), 6.5f, r.hex_color(0x020617), 1.3f);
+
+        char tag[96];
+        if (st_rec.altitude_ft > 1.0f && st_rec.speed_knots > 0.5f) {
+            std::snprintf(tag, sizeof(tag), "%s (%.0fkt %.0fft)",
+                          st_rec.callsign_ssid.c_str(), st_rec.speed_knots, st_rec.altitude_ft);
+        } else if (st_rec.altitude_ft > 1.0f) {
+            std::snprintf(tag, sizeof(tag), "%s (%.0fft)", st_rec.callsign_ssid.c_str(), st_rec.altitude_ft);
+        } else {
+            std::snprintf(tag, sizeof(tag), "%s [%c]", st_rec.callsign_ssid.c_str(), st_rec.symbol_code);
+        }
+        D2D1_RECT_F badge = D2D1::RectF(pt.x + 8.0f, pt.y - 9.0f,
+                                        pt.x + 8.0f + std::min(190.0f, static_cast<float>(std::strlen(tag) * 7 + 10)),
+                                        pt.y + 9.0f);
+        r.fill_round_rect(badge, 3.0f, r.hex_color(0x05080F, 0.86f));
+        r.draw_round_rect(badge, 3.0f, r.hex_color(pcol, 0.75f), 1.0f);
+        r.draw_text(tag, r.font_mono_small, D2D1::RectF(badge.left + 4.0f, badge.top, badge.right - 2.0f, badge.bottom), r.hex_color(pcol));
+    }
+    r.rt->PopAxisAlignedClip();
+
+    // Floating Map Controls & KISS Status Pill
+    D2D1_RECT_F kiss_pill = D2D1::RectF(map_r.left + 8.0f, map_r.top + 8.0f,
+                                        std::min(map_r.right - 220.0f, map_r.left + 490.0f), map_r.top + 32.0f);
+    r.fill_round_rect(kiss_pill, 5.0f, r.hex_color(0x05080F, 0.88f));
+    r.draw_round_rect(kiss_pill, 5.0f, r.hex_color(kiss_conn ? 0x10B981 : 0x334155), 1.0f);
+    char kstat[192];
+    std::snprintf(kstat, sizeof(kstat), "RX:%llu  TX:%llu  GPS:%llu  |  %s",
+                  static_cast<unsigned long long>(hs.aprs->rx_frame_count()),
+                  static_cast<unsigned long long>(hs.aprs->tx_frame_count()),
+                  static_cast<unsigned long long>(gps_count),
+                  hs.aprs_status_banner.c_str());
+    r.draw_text(kstat, r.font_mono_small,
+                D2D1::RectF(kiss_pill.left + 8.0f, kiss_pill.top + 2.0f, kiss_pill.right - 6.0f, kiss_pill.bottom - 2.0f),
+                r.hex_color(kiss_conn ? 0x34D399 : 0x94A3B8));
+
+    float fbx = map_r.right - 210.0f;
+    float fby = map_r.top + 8.0f;
+    draw_hs_btn(r, hs, mouse_pt, fbx + 0*48, fby, 44, 24, HS_GT_ZOOM_IN,    "[+]",   false, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, fbx + 1*48, fby, 44, 24, HS_GT_ZOOM_OUT,   "[-]",   false, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, fbx + 2*48, fby, 54, 24, HS_GT_CENTER_QTH, "QTH",   false, 0xF97316, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, fbx + 3*50, fby, 56, 24, HS_GT_FIT_WORLD,  "World", false, 0x38BDF8, 0, "", true);
+
+    // ---- 2B. Real-Time Scrolling AX.25 Packet Log ----
+    const float log_y = body_y + map_h + 6.0f;
+    D2D1_RECT_F log_card = D2D1::RectF(x, log_y, x + left_w, log_y + log_h);
+    r.fill_round_rect(log_card, 8.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(log_card, 8.0f, r.hex_color(0x1E293B), 1.2f);
+
+    D2D1_RECT_F lhdr = D2D1::RectF(x + 4.0f, log_y + 4.0f, x + left_w - 4.0f, log_y + 25.0f);
+    r.fill_round_rect(lhdr, 4.0f, r.hex_color(0x0F172A));
+    r.draw_text("REAL-TIME AX.25 1200-BAUD TNC2 PACKET STREAM  (KISS Deframer -> AX.25 UI -> APRS 1.01)",
+                r.font_ui_bold, D2D1::RectF(x + 10.0f, log_y + 5.0f, x + left_w - 220.0f, log_y + 24.0f),
+                r.hex_color(0x22D3EE));
+
+    // Beacon Comment inline box on header right
+    D2D1_RECT_F cmt_rc = D2D1::RectF(x + left_w - 225.0f, log_y + 4.0f, x + left_w - 6.0f, log_y + 25.0f);
+    bool cmt_act = (hs.text_focus == HsTextFocus::AprsComment);
+    r.fill_round_rect(cmt_rc, 3.0f, r.hex_color(cmt_act ? 0x16243D : 0x090D16));
+    r.draw_round_rect(cmt_rc, 3.0f, r.hex_color(cmt_act ? 0x00E5FF : 0x334155), 1.0f);
+    r.draw_text("Cmt: " + hs.aprs_comment_edit + (cmt_act ? "|" : ""), r.font_mono_small,
+                D2D1::RectF(cmt_rc.left + 5.0f, cmt_rc.top + 1.0f, cmt_rc.right - 4.0f, cmt_rc.bottom - 1.0f),
+                r.hex_color(0xCBD5E1));
+    hs.add_hit(cmt_rc, HS_APRS_COMMENT_BOX);
+
+    float pry = log_y + 28.0f;
+    const float pr_h = 18.0f;
+    if (aprs_packets.empty()) {
+        r.draw_text("Waiting for AX.25 UI frames on KISS TCP (" + hs.aprs_host_edit + ":" + hs.aprs_port_edit + ")...",
+                    r.font_mono_small, D2D1::RectF(x + 12.0f, pry + 8.0f, x + left_w - 12.0f, pry + 30.0f),
+                    r.hex_color(0x64748B));
+    } else {
+        for (int i = static_cast<int>(aprs_packets.size()) - 1; i >= 0 && pry + pr_h <= log_card.bottom - 4.0f; --i) {
+            const auto& pkt = aprs_packets[static_cast<size_t>(i)];
+            const bool is_msg = (pkt.kind == hamshack::carbon::AprsPacketKind::TextMessage ||
+                                 pkt.kind == hamshack::carbon::AprsPacketKind::MessageAck ||
+                                 pkt.kind == hamshack::carbon::AprsPacketKind::MessageRej);
+            uint32_t col = pkt.is_tx ? 0xFBBF24 : (is_msg ? 0xF472B6 : (pkt.has_position ? 0x34D399 : 0xCBD5E1));
+            std::string line = "[" + std::string(pkt.utc_hms.data()) + "] " + std::string(pkt.tnc2_raw.data());
+            r.draw_text(line, r.font_mono_small,
+                        D2D1::RectF(x + 10.0f, pry, x + left_w - 10.0f, pry + pr_h),
+                        r.hex_color(col));
+            pry += pr_h;
+        }
+    }
+
+    // ---- 2C. Right Column: Heard Stations Roster (Top 44%) + 2-Way APRS Text Messaging (Bottom 56%) ----
+    const float rx_x = x + left_w + 8.0f;
+    const float st_h = std::round(body_h * 0.44f);
+    const float msg_y = body_y + st_h + 6.0f;
+    const float msg_h = body_h - st_h - 6.0f;
+
+    // Heard APRS Stations Card
+    D2D1_RECT_F st_card = D2D1::RectF(rx_x, body_y, rx_x + right_w, body_y + st_h);
+    r.fill_round_rect(st_card, 8.0f, r.hex_color(0x0F172A));
+    r.draw_round_rect(st_card, 8.0f, r.hex_color(0x1E293B), 1.2f);
+    r.draw_text("HEARD APRS GPS STATIONS  (Click to Pan & Message)", r.font_ui_bold,
+                D2D1::RectF(rx_x + 10.0f, body_y + 5.0f, rx_x + right_w - 10.0f, body_y + 23.0f),
+                r.hex_color(0x38BDF8));
+
+    D2D1_RECT_F shdr = D2D1::RectF(rx_x + 6.0f, body_y + 25.0f, rx_x + right_w - 6.0f, body_y + 42.0f);
+    r.fill_round_rect(shdr, 3.0f, r.hex_color(0x05080F));
+    r.draw_text("CALLSIGN    LAT / LON          ALT/SPD   COMMENT", r.font_mono_small,
+                D2D1::RectF(rx_x + 10.0f, body_y + 26.0f, rx_x + right_w - 10.0f, body_y + 41.0f),
+                r.hex_color(0x94A3B8));
+
+    float sry = body_y + 44.0f;
+    const float sr_h = 21.0f;
+    if (aprs_stations.empty()) {
+        r.draw_text("No APRS stations decoded yet.", r.font_mono_small,
+                    D2D1::RectF(rx_x + 12.0f, sry + 10.0f, rx_x + right_w - 12.0f, sry + 30.0f),
+                    r.hex_color(0x64748B));
+    } else {
+        for (int i = 0; i < static_cast<int>(aprs_stations.size()) && sry + sr_h <= st_card.bottom - 4.0f; ++i) {
+            const auto& s = aprs_stations[static_cast<size_t>(i)];
+            D2D1_RECT_F rr = D2D1::RectF(rx_x + 6.0f, sry, rx_x + right_w - 6.0f, sry + sr_h - 1.0f);
+            bool sel = (hs.aprs_selected_call == s.callsign_ssid);
+            bool hov = RendererT::pt_in_rect(mouse_pt, rr);
+            if (sel || hov) {
+                r.fill_round_rect(rr, 4.0f, r.hex_color(sel ? 0x16243D : 0x1E293B));
+            }
+            char row_txt[160];
+            char kin_txt[24] = "-";
+            if (s.altitude_ft > 1.0f) std::snprintf(kin_txt, sizeof(kin_txt), "%.0fft", s.altitude_ft);
+            else if (s.speed_knots > 0.5f) std::snprintf(kin_txt, sizeof(kin_txt), "%.0fkt", s.speed_knots);
+            if (s.has_position) {
+                std::snprintf(row_txt, sizeof(row_txt), "%-10s %+7.3f %+8.3f  %-8s  %s",
+                              s.callsign_ssid.c_str(), s.latitude, s.longitude, kin_txt, s.last_comment.c_str());
+            } else {
+                std::snprintf(row_txt, sizeof(row_txt), "%-10s    ---     ---    %-8s  %s",
+                              s.callsign_ssid.c_str(), kin_txt, s.last_comment.c_str());
+            }
+            r.draw_text(row_txt, r.font_mono_small,
+                        D2D1::RectF(rr.left + 4.0f, rr.top + 1.0f, rr.right - 4.0f, rr.bottom - 1.0f),
+                        r.hex_color(sel ? 0x00E5FF : 0xE2E8F0));
+            hs.add_hit(rr, HS_APRS_STATION_ROW, i, s.callsign_ssid);
+            sry += sr_h;
+        }
+    }
+
+    // 2-Way APRS Text Messaging Sub-Panel
+    D2D1_RECT_F msg_card = D2D1::RectF(rx_x, msg_y, rx_x + right_w, msg_y + msg_h);
+    r.fill_round_rect(msg_card, 8.0f, r.hex_color(0x0F172A));
+    r.draw_round_rect(msg_card, 8.0f, r.hex_color(0x1E293B), 1.2f);
+    r.draw_text("APRS 2-WAY TEXT MESSAGING  (:ADDRESSEE:msg{id + Auto-ACK)", r.font_ui_bold,
+                D2D1::RectF(rx_x + 10.0f, msg_y + 5.0f, rx_x + right_w - 10.0f, msg_y + 23.0f),
+                r.hex_color(0xF472B6));
+
+    const float comp_h = 62.0f;
+    D2D1_RECT_F hist_r = D2D1::RectF(rx_x + 6.0f, msg_y + 26.0f, rx_x + right_w - 6.0f, msg_y + msg_h - comp_h - 6.0f);
+    r.fill_round_rect(hist_r, 5.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(hist_r, 5.0f, r.hex_color(0x1E293B), 1.0f);
+
+    float mry = hist_r.top + 6.0f;
+    const float mr_h = 20.0f;
+    int max_m = std::max(1, static_cast<int>((hist_r.bottom - hist_r.top - 10.0f) / mr_h));
+    int start_m = std::max(0, static_cast<int>(aprs_chats.size()) - max_m);
+    if (aprs_chats.empty()) {
+        r.draw_text("Direct APRS messages & ACK confirmations appear here.", r.font_mono_small,
+                    D2D1::RectF(hist_r.left + 8.0f, mry + 6.0f, hist_r.right - 8.0f, mry + 26.0f),
+                    r.hex_color(0x64748B));
+    } else {
+        for (int i = start_m; i < static_cast<int>(aprs_chats.size()) && mry + mr_h <= hist_r.bottom - 2.0f; ++i) {
+            const auto& m = aprs_chats[static_cast<size_t>(i)];
+            std::string ack_tag;
+            if (m.outbound && !m.msg_id.empty()) {
+                ack_tag = m.acked ? " [ACK \xe2\x9c\x93]" : (m.rejected ? " [REJ \xe2\x9c\x97]" : " [WAIT]");
+            }
+            const std::string& dst_call = m.outbound ? m.peer_call : hs.aprs->full_station_call();
+            std::string mline = "[" + m.utc_hms + "] " + m.sender_call + " -> " + dst_call + ": " + m.text + ack_tag;
+            uint32_t mcol = m.outbound ? (m.acked ? 0x10B981 : 0x38BDF8) : 0xFBBF24;
+            r.draw_text(mline, r.font_mono_small,
+                        D2D1::RectF(hist_r.left + 6.0f, mry, hist_r.right - 6.0f, mry + mr_h),
+                        r.hex_color(mcol));
+            mry += mr_h;
+        }
+    }
+
+    // Composer Row 1: To Callsign + Quick Hints
+    float cy1 = msg_y + msg_h - comp_h;
+    D2D1_RECT_F to_rc = D2D1::RectF(rx_x + 6.0f, cy1, rx_x + 156.0f, cy1 + 26.0f);
+    bool to_act = (hs.text_focus == HsTextFocus::AprsMsgTo);
+    r.fill_round_rect(to_rc, 4.0f, r.hex_color(to_act ? 0x16243D : 0x05080F));
+    r.draw_round_rect(to_rc, 4.0f, r.hex_color(to_act ? 0x00E5FF : 0x334155), to_act ? 1.5f : 1.0f);
+    r.draw_text("To: " + (hs.aprs_msg_to_edit.empty() && !to_act ? std::string("CALL-9") : hs.aprs_msg_to_edit) + (to_act ? "|" : ""),
+                r.font_mono_small, D2D1::RectF(to_rc.left + 6.0f, to_rc.top + 2.0f, to_rc.right - 4.0f, to_rc.bottom - 2.0f),
+                r.hex_color(hs.aprs_msg_to_edit.empty() && !to_act ? 0x64748B : 0x00E5FF));
+    hs.add_hit(to_rc, HS_APRS_MSG_TO_BOX);
+
+    r.draw_text("AX.25 UI via " + hs.aprs_path_edit, r.font_mono_small,
+                D2D1::RectF(to_rc.right + 8.0f, cy1 + 3.0f, rx_x + right_w - 8.0f, cy1 + 24.0f),
+                r.hex_color(0x94A3B8));
+
+    // Composer Row 2: Message Text + Send TX Button
+    float cy2 = cy1 + 30.0f;
+    float send_w = 78.0f;
+    D2D1_RECT_F txt_rc = D2D1::RectF(rx_x + 6.0f, cy2, rx_x + right_w - send_w - 10.0f, cy2 + 27.0f);
+    bool txt_act = (hs.text_focus == HsTextFocus::AprsMsgText);
+    r.fill_round_rect(txt_rc, 4.0f, r.hex_color(txt_act ? 0x16243D : 0x05080F));
+    r.draw_round_rect(txt_rc, 4.0f, r.hex_color(txt_act ? 0xF472B6 : 0x334155), txt_act ? 1.5f : 1.0f);
+    std::string body_disp = hs.aprs_msg_text_edit.empty() && !txt_act
+        ? "Type APRS message (max 67 chars)..."
+        : (hs.aprs_msg_text_edit + (txt_act ? "|" : ""));
+    r.draw_text(body_disp, r.font_mono_small,
+                D2D1::RectF(txt_rc.left + 6.0f, txt_rc.top + 2.0f, txt_rc.right - 4.0f, txt_rc.bottom - 2.0f),
+                r.hex_color(hs.aprs_msg_text_edit.empty() && !txt_act ? 0x64748B : 0xF8FAFC));
+    hs.add_hit(txt_rc, HS_APRS_MSG_TEXT_BOX);
+
+    draw_hs_btn(r, hs, mouse_pt, rx_x + right_w - send_w - 6.0f, cy2, send_w, 27.0f,
+                HS_APRS_MSG_SEND, "Send TX", !hs.aprs_msg_text_edit.empty(), 0x10B981, 0, "", true);
+
+    render_carbon_audio_dropdown_overlay(r, hs, mouse_pt);
+}
+
+// ============================================================================
+// TAB 10: SSTV — 14-Mode Slow-Scan TV Transceiver (Hilbert FM RX + 48 kHz TX)
+// ============================================================================
+template <typename RendererT, typename AppT>
+inline void render_sstv_workspace(RendererT& r, AppT& /*app*/, HamShackSuite& hs, POINT mouse_pt,
+                                  float x, float y, float w, float h) {
+    if (!hs.sstv) return;
+    const auto tel = hs.sstv->telemetry();
+    const auto& rx_spec = hamshack::carbon::sstv_mode_spec(tel.active_rx_mode);
+    const auto& tx_spec = hamshack::carbon::sstv_mode_spec(tel.tx_mode);
+    const float rx_rms_db = hs.audio_router ? hs.audio_router->telemetry().active_rms_dbfs : -120.0f;
+    const bool rx_decoding = (tel.rx_state == hamshack::carbon::SstvRxState::ReceivingImage);
+
+    // 1. Top Control Strip (AudioRouter Dropdown + Canvas View + Live DSP Telemetry)
+    const float bar_h = 34.0f;
+    D2D1_RECT_F bar_r = D2D1::RectF(x, y, x + w, y + bar_h);
+    r.fill_round_rect(bar_r, 6.0f, r.hex_color(0x0A0F1D));
+    r.draw_round_rect(bar_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
+
+    float cx = x + 6.0f;
+    render_carbon_audio_source_bar(r, hs, mouse_pt, cx, y + 4.0f, 285.0f);
+    cx += 285.0f + 5.0f + 185.0f + 8.0f;
+
+    const char* view_lbl = (hs.sstv_canvas_layout == 0) ? "View: Split RX+TX"
+                         : (hs.sstv_canvas_layout == 1) ? "View: Large RX"
+                                                        : "View: Large TX";
+    draw_hs_btn(r, hs, mouse_pt, cx, y + 4.0f, 128.0f, 26.0f, HS_SSTV_VIEW_CYCLE,
+                view_lbl, false, 0xA855F7, 0, "", true);
+    cx += 134.0f;
+
+    // Live FM Discriminator & VIS Status Pill
+    D2D1_RECT_F tel_r = D2D1::RectF(cx, y + 4.0f, x + w - 6.0f, y + 30.0f);
+    r.fill_round_rect(tel_r, 4.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(tel_r, 4.0f, r.hex_color(tel.tx_active ? 0xEF4444 : (rx_decoding ? 0x10B981 : 0x334155)), 1.0f);
+    const char* st_name = tel.tx_active ? "TRANSMITTING"
+                        : rx_decoding ? "DECODING SCANLINES"
+                        : (tel.rx_state == hamshack::carbon::SstvRxState::DecodingVisBits) ? "VIS HEADER SYNC"
+                                                                                           : "LISTENING (VIS ARMED)";
+    char tbuf[220];
+    std::snprintf(tbuf, sizeof(tbuf), "%s  |  RX: %s (%ux%u)  |  Tone: %.0f Hz (%.1f dBFS)  |  Slant: %+.1f ppm",
+                  st_name, std::string(rx_spec.short_name).c_str(), rx_spec.width, rx_spec.height,
+                  tel.inst_freq_hz, rx_rms_db, tel.auto_slant_ppm + tel.slant_ppm);
+    r.draw_text(tbuf, r.font_mono_small, D2D1::RectF(tel_r.left + 8.0f, tel_r.top + 2.0f, tel_r.right - 6.0f, tel_r.bottom - 2.0f),
+                r.hex_color(tel.tx_active ? 0xFCA5A5 : (rx_decoding ? 0x34D399 : 0x38BDF8)));
+
+    // 2. Three-Column Workstation Layout:
+    //    Left: 1000-2500 Hz Tuning Waterfall + RX Controls
+    //    Center: GPU Progressive Scanline RX & TX Preview Canvas
+    //    Right: SSTV TX Studio (14 Modes, Load Image, 1-Bit Dither, Text Overlay, Send / Abort TX)
+    const float body_y = y + bar_h + 6.0f;
+    const float body_h = std::max(150.0f, h - bar_h - 6.0f);
+    const float left_w = std::clamp(w * 0.24f, 275.0f, 340.0f);
+    const float right_w = std::clamp(w * 0.25f, 290.0f, 360.0f);
+    const float center_x = x + left_w + 6.0f;
+    const float center_w = std::max(260.0f, w - left_w - right_w - 12.0f);
+    const float right_x = center_x + center_w + 6.0f;
+
+    // ---- 2A. Left Column: 1000-2500 Hz Waterfall + RX Controls ----
+    D2D1_RECT_F lcard = D2D1::RectF(x, body_y, x + left_w, body_y + body_h);
+    r.fill_round_rect(lcard, 8.0f, r.hex_color(0x0F172A));
+    r.draw_round_rect(lcard, 8.0f, r.hex_color(0x1E293B), 1.2f);
+
+    r.draw_text("SSTV TUNING WATERFALL (1000-2500 Hz)", r.font_ui_bold,
+                D2D1::RectF(x + 10.0f, body_y + 5.0f, x + left_w - 8.0f, body_y + 23.0f),
+                r.hex_color(0x00E5FF));
+
+    const float rx_ctrl_h = 206.0f;
+    const float wf_box_y = body_y + 26.0f;
+    const float wf_box_h = std::max(90.0f, body_h - rx_ctrl_h - 32.0f);
+    D2D1_RECT_F wf_box = D2D1::RectF(x + 8.0f, wf_box_y, x + left_w - 8.0f, wf_box_y + wf_box_h);
+    r.fill_round_rect(wf_box, 5.0f, r.hex_color(0x040711));
+    r.draw_round_rect(wf_box, 5.0f, r.hex_color(0x26354D), 1.0f);
+
+    const float ruler_h = 18.0f;
+    const float spec_h = std::clamp(wf_box_h * 0.26f, 28.0f, 56.0f);
+    const float spec_y = wf_box.top + ruler_h;
+    const float wf_img_y = spec_y + spec_h;
+    const float wf_img_h = std::max(24.0f, wf_box.bottom - wf_img_y - 2.0f);
+    const float plot_x = wf_box.left + 3.0f;
+    const float plot_w = std::max(60.0f, (wf_box.right - wf_box.left) - 6.0f);
+
+    // Zero-allocation GPU upload of pre-rendered BGRA32 SSTV waterfall surface (256x112)
+    auto wf_surf = hs.sstv->waterfall_surface();
+    D2D1_RECT_F wf_dst = D2D1::RectF(plot_x, wf_img_y, plot_x + plot_w, wf_img_y + wf_img_h);
+    r.draw_bgra_surface(2, wf_surf.data(),
+                        static_cast<int>(hamshack::carbon::SstvEngine::kWaterfallW),
+                        static_cast<int>(hamshack::carbon::SstvEngine::kWaterfallH),
+                        static_cast<int>(hamshack::carbon::SstvEngine::kWaterfallW),
+                        tel.wf_surface_seq, wf_dst, false);
+
+    // Live Spectrum Trace (1000..2500 Hz)
+    auto spec_span = hs.sstv->spectrum_db();
+    D2D1_POINT_2F prev_pt{};
+    constexpr int kWfBins = static_cast<int>(hamshack::carbon::SstvEngine::kWaterfallW);
+    for (int b = 0; b < kWfBins; ++b) {
+        float fx = plot_x + (static_cast<float>(b) / static_cast<float>(kWfBins - 1)) * plot_w;
+        float norm = std::clamp((spec_span[static_cast<size_t>(b)] + 95.0f) / 65.0f, 0.0f, 1.0f);
+        float fy = spec_y + spec_h - 2.0f - norm * (spec_h - 4.0f);
+        D2D1_POINT_2F cur_pt = D2D1::Point2F(fx, fy);
+        if (b > 0) r.draw_line(prev_pt, cur_pt, r.hex_color(0x00E5FF), 1.3f);
+        prev_pt = cur_pt;
+    }
+
+    // SSTV Subcarrier Reference Guides: 1200 (Sync), 1500 (Black), 1900 (VIS), 2300 (White)
+    struct ToneGuide { float hz; const char* lbl; uint32_t col; };
+    static constexpr ToneGuide kGuides[4] = {
+        {1200.0f, "1200S", 0xEF4444},
+        {1500.0f, "1500B", 0x38BDF8},
+        {1900.0f, "1900V", 0xFBBF24},
+        {2300.0f, "2300W", 0x10B981}
+    };
+    for (const auto& g : kGuides) {
+        float gx = plot_x + ((g.hz - 1000.0f) / 1500.0f) * plot_w;
+        r.draw_line(D2D1::Point2F(gx, spec_y), D2D1::Point2F(gx, wf_img_y + wf_img_h), r.hex_color(g.col, 0.55f), 1.0f);
+        r.draw_text(g.lbl, r.font_mono_small, D2D1::RectF(gx - 18.0f, wf_box.top + 1.0f, gx + 20.0f, wf_box.top + ruler_h),
+                    r.hex_color(g.col), DWRITE_TEXT_ALIGNMENT_CENTER);
+    }
+
+    // RX Controls Block below Waterfall
+    float ry = wf_box.bottom + 6.0f;
+    r.draw_text("RX DECODER & SLANT CONTROLS:", r.font_small,
+                D2D1::RectF(x + 10.0f, ry, x + left_w - 10.0f, ry + 16.0f), r.hex_color(0xFBBF24));
+    ry += 18.0f;
+
+    const bool auto_vis = tel.auto_vis_enabled;
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f, ry, (left_w - 20.0f) * 0.54f, 25.0f, HS_SSTV_AUTO_VIS_TOG,
+                auto_vis ? "VIS: Auto Detect" : "VIS: Manual Lock", auto_vis, 0x10B981, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 12.0f + (left_w - 20.0f) * 0.54f, ry, (left_w - 20.0f) * 0.46f, 25.0f, HS_SSTV_FORCE_RX,
+                "Force Decode", !auto_vis, 0xF59E0B, 0, "", true);
+    ry += 29.0f;
+
+    // Manual Mode Selector (< Mode >)
+    const auto& man_spec = hamshack::carbon::sstv_mode_spec(hs.sstv_manual_mode);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f, ry, 30.0f, 25.0f, HS_SSTV_RX_MODE_PREV, "<", false, 0x38BDF8, 0, "", true);
+    D2D1_RECT_F rxm_box = D2D1::RectF(x + 41.0f, ry, x + left_w - 41.0f, ry + 25.0f);
+    r.fill_round_rect(rxm_box, 4.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(rxm_box, 4.0f, r.hex_color(0x26354D), 1.0f);
+    r.draw_text(std::string(man_spec.name), r.font_mono_small,
+                rxm_box, r.hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_hs_btn(r, hs, mouse_pt, x + left_w - 38.0f, ry, 30.0f, 25.0f, HS_SSTV_RX_MODE_NEXT, ">", false, 0x38BDF8, 0, "", true);
+    ry += 29.0f;
+
+    // Slant Adjust Row (-50, -5, 0 ppm, +5, +50)
+    float sl_w = (left_w - 16.0f - 16.0f) / 5.0f;
+    char zero_lbl[24];
+    std::snprintf(zero_lbl, sizeof(zero_lbl), "%+.0fppm", tel.slant_ppm);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f + 0*(sl_w+4), ry, sl_w, 24.0f, HS_SSTV_SLANT_M10, "-50", false, 0x38BDF8, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f + 1*(sl_w+4), ry, sl_w, 24.0f, HS_SSTV_SLANT_M1,  "-5",  false, 0x38BDF8, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f + 2*(sl_w+4), ry, sl_w, 24.0f, HS_SSTV_SLANT_ZERO,zero_lbl, std::abs(tel.slant_ppm) > 0.1f, 0xFBBF24, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f + 3*(sl_w+4), ry, sl_w, 24.0f, HS_SSTV_SLANT_P1,  "+5",  false, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f + 4*(sl_w+4), ry, sl_w, 24.0f, HS_SSTV_SLANT_P10, "+50", false, 0x00E5FF, 0, "", true);
+    ry += 28.0f;
+
+    // Clear Canvas + Auto-Save PNG + Save Now
+    float b3_w = (left_w - 24.0f) / 3.0f;
+    draw_hs_btn(r, hs, mouse_pt, x + 8.0f,                 ry, b3_w, 25.0f, HS_SSTV_CLEAR_RX, "Clear RX", false, 0xEF4444, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 12.0f + b3_w,         ry, b3_w, 25.0f, HS_SSTV_AUTOSAVE_TOG,
+                tel.auto_save_png ? "AutoPNG:ON" : "AutoPNG:OFF", tel.auto_save_png, 0x10B981, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, x + 16.0f + b3_w * 2.0f,  ry, b3_w, 25.0f, HS_SSTV_SAVE_NOW, "Save PNG", false, 0x38BDF8, 0, "", true);
+    ry += 29.0f;
+
+    std::string saved_path = hs.sstv->last_saved_png_path();
+    std::string footer_str = saved_path.empty()
+        ? ("RX Frames: " + std::to_string(tel.rx_completed_images) + " (Saves to ./sstv_captures/)")
+        : ("Saved: " + saved_path);
+    r.draw_text(footer_str, r.font_mono_small,
+                D2D1::RectF(x + 10.0f, ry, x + left_w - 8.0f, body_y + body_h - 4.0f),
+                r.hex_color(saved_path.empty() ? 0x64748B : 0x34D399));
+
+    // ---- 2B. Center Column: Progressive Scanline RX Surface & TX Preview ----
+    D2D1_RECT_F ccard = D2D1::RectF(center_x, body_y, center_x + center_w, body_y + body_h);
+    r.fill_round_rect(ccard, 8.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(ccard, 8.0f, r.hex_color(0x1E293B), 1.2f);
+
+    auto draw_fitted_raster = [&](int gpu_slot, const uint32_t* px, int rw, int rh, uint64_t seq,
+                                  const D2D1_RECT_F& pane, const std::string& title, uint32_t title_col,
+                                  bool nearest_px, int active_line) {
+        r.draw_text(title, r.font_ui_bold,
+                    D2D1::RectF(pane.left + 8.0f, pane.top + 4.0f, pane.right - 8.0f, pane.top + 22.0f),
+                    r.hex_color(title_col));
+        D2D1_RECT_F avail = D2D1::RectF(pane.left + 8.0f, pane.top + 24.0f, pane.right - 8.0f, pane.bottom - 8.0f);
+        float aw = std::max(32.0f, avail.right - avail.left);
+        float ah = std::max(32.0f, avail.bottom - avail.top);
+        float scale = std::min(aw / static_cast<float>(std::max(1, rw)),
+                               ah / static_cast<float>(std::max(1, rh)));
+        float dw = std::max(16.0f, rw * scale);
+        float dh = std::max(16.0f, rh * scale);
+        float dx = avail.left + (aw - dw) * 0.5f;
+        float dy = avail.top + (ah - dh) * 0.5f;
+        D2D1_RECT_F img_r = D2D1::RectF(dx, dy, dx + dw, dy + dh);
+        r.fill_round_rect(D2D1::RectF(img_r.left - 2.0f, img_r.top - 2.0f, img_r.right + 2.0f, img_r.bottom + 2.0f),
+                          3.0f, r.hex_color(0x020617));
+        r.draw_bgra_surface(gpu_slot, px, rw, rh, static_cast<int>(hamshack::carbon::SstvEngine::kMaxWidth), seq, img_r, nearest_px);
+        r.draw_round_rect(img_r, 1.0f, r.hex_color(title_col, 0.7f), 1.1f);
+
+        if (active_line >= 0 && active_line < rh) {
+            float ly = img_r.top + (static_cast<float>(active_line) / static_cast<float>(rh)) * dh;
+            r.draw_line(D2D1::Point2F(img_r.left, ly), D2D1::Point2F(img_r.right, ly),
+                        r.hex_color(0x10B981, 0.92f), 1.8f);
+        }
+    };
+
+    uint16_t rx_w_u = 320, rx_h_u = 256;
+    auto rx_surf = hs.sstv->active_rx_surface(rx_w_u, rx_h_u);
+    uint16_t tx_w_u = 320, tx_h_u = 256;
+    auto tx_surf = hs.sstv->tx_preview_surface(tx_w_u, tx_h_u);
+    const int rx_w = static_cast<int>(rx_w_u);
+    const int rx_h = static_cast<int>(rx_h_u);
+    const int tx_w = static_cast<int>(tx_w_u);
+    const int tx_h = static_cast<int>(tx_h_u);
+
+    char rx_hdr[128];
+    std::snprintf(rx_hdr, sizeof(rx_hdr), "LIVE RX PROGRESSIVE SCANLINE CANVAS — %s (%dx%d, Line %u/%d)",
+                  std::string(rx_spec.short_name).c_str(), rx_w, rx_h, tel.rx_current_line, rx_h);
+    char tx_hdr[128];
+    std::snprintf(tx_hdr, sizeof(tx_hdr), "TX RASTER PREVIEW — %s (%dx%d%s)",
+                  std::string(tx_spec.short_name).c_str(), tx_w, tx_h,
+                  tel.tx_dither_1bit ? ", 1-Bit Floyd-Steinberg" : "");
+
+    const int cur_line_vis = rx_decoding ? static_cast<int>(tel.rx_current_line) : -1;
+    if (hs.sstv_canvas_layout == 1) {
+        draw_fitted_raster(0, rx_surf.data(), rx_w, rx_h, tel.rx_surface_seq, ccard, rx_hdr, 0x00E5FF, false, cur_line_vis);
+    } else if (hs.sstv_canvas_layout == 2) {
+        draw_fitted_raster(1, tx_surf.data(), tx_w, tx_h, tel.tx_preview_seq, ccard, tx_hdr, 0xF472B6, tel.tx_dither_1bit, -1);
+    } else {
+        // Split RX + TX side-by-side (or stacked if narrow)
+        if (center_w >= 540.0f) {
+            float half_w = (center_w - 6.0f) * 0.5f;
+            D2D1_RECT_F lp = D2D1::RectF(center_x, body_y, center_x + half_w, body_y + body_h);
+            D2D1_RECT_F rp = D2D1::RectF(center_x + half_w + 6.0f, body_y, center_x + center_w, body_y + body_h);
+            r.draw_line(D2D1::Point2F(center_x + half_w + 3.0f, body_y + 8.0f),
+                        D2D1::Point2F(center_x + half_w + 3.0f, body_y + body_h - 8.0f),
+                        r.hex_color(0x1E293B), 1.0f);
+            draw_fitted_raster(0, rx_surf.data(), rx_w, rx_h, tel.rx_surface_seq, lp, rx_hdr, 0x00E5FF, false, cur_line_vis);
+            draw_fitted_raster(1, tx_surf.data(), tx_w, tx_h, tel.tx_preview_seq, rp, tx_hdr, 0xF472B6, tel.tx_dither_1bit, -1);
+        } else {
+            float half_h = (body_h - 6.0f) * 0.5f;
+            D2D1_RECT_F tp = D2D1::RectF(center_x, body_y, center_x + center_w, body_y + half_h);
+            D2D1_RECT_F bp = D2D1::RectF(center_x, body_y + half_h + 6.0f, center_x + center_w, body_y + body_h);
+            draw_fitted_raster(0, rx_surf.data(), rx_w, rx_h, tel.rx_surface_seq, tp, rx_hdr, 0x00E5FF, false, cur_line_vis);
+            draw_fitted_raster(1, tx_surf.data(), tx_w, tx_h, tel.tx_preview_seq, bp, tx_hdr, 0xF472B6, tel.tx_dither_1bit, -1);
+        }
+    }
+
+    // ---- 2C. Right Column: SSTV TX Modulator Studio ----
+    D2D1_RECT_F rcard = D2D1::RectF(right_x, body_y, right_x + right_w, body_y + body_h);
+    r.fill_round_rect(rcard, 8.0f, r.hex_color(0x0F172A));
+    r.draw_round_rect(rcard, 8.0f, r.hex_color(0x1E293B), 1.2f);
+
+    r.draw_text("SSTV TX MODULATOR STUDIO (48 kHz)", r.font_ui_bold,
+                D2D1::RectF(right_x + 10.0f, body_y + 6.0f, right_x + right_w - 10.0f, body_y + 24.0f),
+                r.hex_color(0xF472B6));
+
+    float ty = body_y + 28.0f;
+    r.draw_text("1. SELECT TRANSMIT SSTV MODE (14 MODES):", r.font_small,
+                D2D1::RectF(right_x + 10.0f, ty, right_x + right_w - 10.0f, ty + 16.0f), r.hex_color(0x94A3B8));
+    ty += 18.0f;
+
+    draw_hs_btn(r, hs, mouse_pt, right_x + 8.0f, ty, 32.0f, 28.0f, HS_SSTV_TX_MODE_PREV, "<", false, 0xF472B6, 0, "", true);
+    D2D1_RECT_F txm_r = D2D1::RectF(right_x + 44.0f, ty, right_x + right_w - 44.0f, ty + 28.0f);
+    r.fill_round_rect(txm_r, 4.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(txm_r, 4.0f, r.hex_color(0xF472B6, 0.7f), 1.0f);
+    r.draw_text(std::string(tx_spec.name), r.font_ui_bold, txm_r, r.hex_color(0xF8FAFC), DWRITE_TEXT_ALIGNMENT_CENTER);
+    draw_hs_btn(r, hs, mouse_pt, right_x + right_w - 40.0f, ty, 32.0f, 28.0f, HS_SSTV_TX_MODE_NEXT, ">", false, 0xF472B6, 0, "", true);
+    ty += 32.0f;
+
+    // Mode Spec Summary Card
+    double frame_sec = (tx_spec.encoding == hamshack::carbon::SstvColorEncoding::PdDualLineYuv)
+        ? ((tx_spec.height * 0.5) * tx_spec.line_period_ms / 1000.0)
+        : (tx_spec.height * tx_spec.line_period_ms / 1000.0);
+    const char* cspace = (tx_spec.encoding == hamshack::carbon::SstvColorEncoding::GrayscaleBw)
+                       ? "Grayscale Luminance (No Chroma)"
+                       : (tx_spec.encoding == hamshack::carbon::SstvColorEncoding::GbrSequential ||
+                          tx_spec.encoding == hamshack::carbon::SstvColorEncoding::GbrMidSync)
+                           ? "GBR Sequential"
+                           : "YCrCb Subcarrier";
+    D2D1_RECT_F spec_card = D2D1::RectF(right_x + 8.0f, ty, right_x + right_w - 8.0f, ty + 42.0f);
+    r.fill_round_rect(spec_card, 5.0f, r.hex_color(0x05080F));
+    r.draw_round_rect(spec_card, 5.0f, r.hex_color(0x1E293B), 1.0f);
+    char sline1[96], sline2[96];
+    std::snprintf(sline1, sizeof(sline1), "Res: %ux%u  |  VIS: 0x%02X (%u)  |  %.1fs",
+                  tx_spec.width, tx_spec.height, tx_spec.vis_code, tx_spec.vis_code, frame_sec);
+    std::snprintf(sline2, sizeof(sline2), "Encoding: %s", cspace);
+    r.draw_text(sline1, r.font_mono_small, D2D1::RectF(spec_card.left + 8.0f, ty + 3.0f, spec_card.right - 6.0f, ty + 20.0f), r.hex_color(0x38BDF8));
+    r.draw_text(sline2, r.font_mono_small, D2D1::RectF(spec_card.left + 8.0f, ty + 21.0f, spec_card.right - 6.0f, ty + 39.0f), r.hex_color(0x34D399));
+    ty += 48.0f;
+
+    // Image Loader + Test Card
+    r.draw_text("2. SOURCE IMAGE & RASTER PRE-PROCESSING:", r.font_small,
+                D2D1::RectF(right_x + 10.0f, ty, right_x + right_w - 10.0f, ty + 16.0f), r.hex_color(0x94A3B8));
+    ty += 18.0f;
+
+    float half_btn = (right_w - 20.0f) * 0.5f;
+    draw_hs_btn(r, hs, mouse_pt, right_x + 8.0f, ty, half_btn, 28.0f, HS_SSTV_LOAD_IMG,
+                "\xf0\x9f\x93\x82 Load Image...", false, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, right_x + 12.0f + half_btn, ty, half_btn, 28.0f, HS_SSTV_TEST_CARD,
+                "\xf0\x9f\x8e\xa8 Test Card", false, 0xFBBF24, 0, "", true);
+    ty += 34.0f;
+
+    // 1-Bit Floyd-Steinberg Dithering Toggle
+    draw_hs_btn(r, hs, mouse_pt, right_x + 8.0f, ty, right_w - 16.0f, 27.0f, HS_SSTV_DITHER_TOG,
+                tel.tx_dither_1bit
+                    ? "\xe2\x96\xa3 1-Bit Floyd-Steinberg Dither: ENABLED"
+                    : "\xe2\x96\xa2 1-Bit Floyd-Steinberg Dither: OFF (Continuous)",
+                tel.tx_dither_1bit, 0xA855F7, 0, "", true);
+    ty += 33.0f;
+
+    // Text Overlay Input Box (Callsign / Grid / RST)
+    r.draw_text("3. CALLSIGN / GRID / RST RASTER OVERLAY:", r.font_small,
+                D2D1::RectF(right_x + 10.0f, ty, right_x + right_w - 10.0f, ty + 16.0f), r.hex_color(0x94A3B8));
+    ty += 18.0f;
+
+    D2D1_RECT_F ov_rc = D2D1::RectF(right_x + 8.0f, ty, right_x + right_w - 8.0f, ty + 28.0f);
+    bool ov_act = (hs.text_focus == HsTextFocus::SstvOverlay);
+    r.fill_round_rect(ov_rc, 4.0f, r.hex_color(ov_act ? 0x16243D : 0x05080F));
+    r.draw_round_rect(ov_rc, 4.0f, r.hex_color(ov_act ? 0x00E5FF : 0x334155), ov_act ? 1.5f : 1.0f);
+    r.draw_text(hs.sstv_overlay_edit + (ov_act ? "|" : ""), r.font_mono_small,
+                D2D1::RectF(ov_rc.left + 8.0f, ov_rc.top + 3.0f, ov_rc.right - 6.0f, ov_rc.bottom - 3.0f),
+                r.hex_color(0xF8FAFC));
+    hs.add_hit(ov_rc, HS_SSTV_OVERLAY_BOX);
+    ty += 34.0f;
+
+    // Embedded mini TX preview when in Large RX mode and vertical space permits
+    float bottom_block_h = 104.0f;
+    if (hs.sstv_canvas_layout == 1 && (body_y + body_h - bottom_block_h - ty) >= 90.0f) {
+        D2D1_RECT_F mini_p = D2D1::RectF(right_x + 6.0f, ty, right_x + right_w - 6.0f, body_y + body_h - bottom_block_h - 4.0f);
+        draw_fitted_raster(1, tx_surf.data(), tx_w, tx_h, tel.tx_preview_seq, mini_p, "TX PREVIEW", 0xF472B6,
+                           tel.tx_dither_1bit, -1);
+    }
+
+    // TX Progress Bar + Send + Abort TX pinned cleanly at bottom of Right Studio Card
+    float by = body_y + body_h - bottom_block_h;
+    D2D1_RECT_F prog_bg = D2D1::RectF(right_x + 8.0f, by, right_x + right_w - 8.0f, by + 24.0f);
+    r.fill_round_rect(prog_bg, 5.0f, r.hex_color(0x05080F));
+    if (tel.tx_active || tel.tx_progress > 0.001f) {
+        float pw = (prog_bg.right - prog_bg.left) * std::clamp(tel.tx_progress, 0.0f, 1.0f);
+        r.fill_round_rect(D2D1::RectF(prog_bg.left, prog_bg.top, prog_bg.left + pw, prog_bg.bottom),
+                          5.0f, r.hex_color(tel.tx_active ? 0x10B981 : 0x334155, 0.65f));
+    }
+    r.draw_round_rect(prog_bg, 5.0f, r.hex_color(tel.tx_active ? 0x10B981 : 0x26354D), 1.0f);
+    char ptxt[96];
+    if (tel.tx_active) {
+        std::snprintf(ptxt, sizeof(ptxt), "TX PROGRESS: %5.1f%%  (1.5ms Taper Armed)", tel.tx_progress * 100.0f);
+    } else {
+        std::snprintf(ptxt, sizeof(ptxt), "TX IDLE — Ready (%s)",
+                      hs.audio_router && hs.audio_router->active_source() == hamshack::carbon::AudioSource::UsbDongleVhf
+                          ? "UV-5R VOX 48kHz" : "Xiegu G90 CAT PTT");
+    }
+    r.draw_text(ptxt, r.font_mono_small, prog_bg, r.hex_color(tel.tx_active ? 0xF8FAFC : 0x94A3B8),
+                DWRITE_TEXT_ALIGNMENT_CENTER);
+    by += 30.0f;
+
+    draw_hs_btn(r, hs, mouse_pt, right_x + 8.0f, by, half_btn, 34.0f, HS_SSTV_SEND_TX,
+                tel.tx_active ? "\xf0\x9f\x93\xa1 Transmitting..." : "\xf0\x9f\x93\xa1 Send SSTV",
+                tel.tx_active, 0x10B981, 0, "", false);
+    draw_hs_btn(r, hs, mouse_pt, right_x + 12.0f + half_btn, by, half_btn, 34.0f, HS_SSTV_ABORT_TX,
+                "\xe2\x9b\x94 Abort TX", false, 0xEF4444, 0, "", false);
+    by += 38.0f;
+
+    r.draw_text(hs.sstv_status_banner, r.font_mono_small,
+                D2D1::RectF(right_x + 8.0f, by, right_x + right_w - 8.0f, body_y + body_h - 3.0f),
+                r.hex_color(0x38BDF8));
+
+    render_carbon_audio_dropdown_overlay(r, hs, mouse_pt);
+}
+
+// ============================================================================
 // Mouse Click & Keyboard Handler for HamShack++ Top Deck & Mode Tabs
 // ============================================================================
 template <typename AppT>
-inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt) {
+inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, HWND hwnd = nullptr) {
+    if (hs.audio_source_dropdown_open) {
+        for (const auto& h : hs.hits) {
+            if (pt.x < h.rect.left || pt.x > h.rect.right || pt.y < h.rect.top || pt.y > h.rect.bottom) continue;
+            if (h.id == HS_AUDIO_SRC_OPT_G90) {
+                if (hs.audio_router) hs.audio_router->select_source(hamshack::carbon::AudioSource::PrimaryG90);
+                hs.audio_source_dropdown_open = false;
+                return true;
+            }
+            if (h.id == HS_AUDIO_SRC_OPT_DONGLE) {
+                if (hs.audio_router) hs.audio_router->select_source(hamshack::carbon::AudioSource::UsbDongleVhf);
+                hs.audio_source_dropdown_open = false;
+                return true;
+            }
+        }
+        hs.audio_source_dropdown_open = false;
+    }
     if (hs.irc_menu.is_open) {
         for (const auto& h : hs.hits) {
             if (pt.x < h.rect.left || pt.x > h.rect.right || pt.y < h.rect.top || pt.y > h.rect.bottom) continue;
@@ -4221,6 +5183,209 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt) {
             case HS_TAB_IRC:    hs.switch_mode_tab(6); return true;
             case HS_TAB_WINLINK:hs.switch_mode_tab(7); return true;
             case HS_TAB_CONFIG: hs.switch_mode_tab(8); return true;
+            case HS_TAB_APRS:   hs.switch_mode_tab(9); return true;
+            case HS_TAB_SSTV:   hs.switch_mode_tab(10); return true;
+
+            case HS_AUDIO_SRC_DROPDOWN:
+                hs.audio_source_dropdown_open = !hs.audio_source_dropdown_open;
+                return true;
+            case HS_AUDIO_DONGLE_CYCLE: {
+                if (hs.audio_router) {
+                    hs.audio_router->refresh_usb_dongle_devices(hs.soundcard.selected_input_idx);
+                    auto devs = hs.audio_router->devices();
+                    if (!devs.empty()) {
+                        int cur = hs.audio_router->selected_dongle_device_index();
+                        int nxt = (cur < 0) ? 0 : ((cur + 1) % static_cast<int>(devs.size()));
+                        hs.audio_router->bind_usb_dongle_device(nxt);
+                    }
+                }
+                return true;
+            }
+
+            // APRS Tab Controls
+            case HS_APRS_HOST_BOX:    hs.text_focus = HsTextFocus::AprsHost; return true;
+            case HS_APRS_PORT_BOX:    hs.text_focus = HsTextFocus::AprsPort; return true;
+            case HS_APRS_PATH_BOX:    hs.text_focus = HsTextFocus::AprsPath; return true;
+            case HS_APRS_COMMENT_BOX: hs.text_focus = HsTextFocus::AprsComment; return true;
+            case HS_APRS_MSG_TO_BOX:  hs.text_focus = HsTextFocus::AprsMsgTo; return true;
+            case HS_APRS_MSG_TEXT_BOX:hs.text_focus = HsTextFocus::AprsMsgText; return true;
+            case HS_APRS_SSID_CYCLE: {
+                hs.aprs_ssid = (hs.aprs_ssid + 1) % 16;
+                if (hs.aprs) hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                auto& cfg = hamshack::get_app_config();
+                cfg.aprs_ssid = hs.aprs_ssid;
+                cfg.save();
+                return true;
+            }
+            case HS_APRS_CONNECT_TOG: {
+                if (!hs.aprs) return true;
+                if (hs.aprs->is_running()) {
+                    hs.aprs->disconnect_kiss();
+                    hs.aprs_status_banner = "Disconnected from KISS TCP";
+                } else {
+                    int port = std::clamp(std::atoi(hs.aprs_port_edit.c_str()), 1, 65535);
+                    hs.aprs_port_edit = std::to_string(port);
+                    auto& cfg = hamshack::get_app_config();
+                    cfg.aprs_kiss_host = hs.aprs_host_edit;
+                    cfg.aprs_kiss_port = port;
+                    cfg.aprs_digi_path = hs.aprs_path_edit;
+                    cfg.save();
+                    hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                    hs.aprs->set_kiss_endpoint(hs.aprs_host_edit, static_cast<uint16_t>(port));
+                    hs.aprs->connect_kiss();
+                    hs.aprs_status_banner = "Connecting to Dire Wolf KISS TCP (" + hs.aprs_host_edit + ":" + hs.aprs_port_edit + ")...";
+                }
+                return true;
+            }
+            case HS_APRS_BEACON_TX: {
+                if (hs.aprs) {
+                    hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                    double lat = 41.7147, lon = -72.7272;
+                    hamshack::Ft8Ft4Engine::grid_to_latlon(hs.hf_grid, lat, lon);
+                    if (hs.aprs->send_position_beacon(lat, lon, '/', '-', hs.aprs_comment_edit)) {
+                        hs.aprs_status_banner = "Queued AX.25 GPS Beacon (" + hs.aprs->full_station_call() + ")";
+                    } else {
+                        hs.aprs_status_banner = "Beacon queue full — check KISS TCP connection";
+                    }
+                }
+                return true;
+            }
+            case HS_APRS_MSG_SEND: {
+                if (hs.aprs && !hs.aprs_msg_to_edit.empty() && !hs.aprs_msg_text_edit.empty()) {
+                    hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                    hs.aprs->send_text_message(hs.aprs_msg_to_edit, hs.aprs_msg_text_edit);
+                    hs.aprs_msg_text_edit.clear();
+                }
+                return true;
+            }
+            case HS_APRS_CLEAR_BTN: {
+                if (hs.aprs) hs.aprs->clear_logs();
+                return true;
+            }
+            case HS_APRS_STATION_ROW: {
+                hs.aprs_selected_call = h.payload;
+                hs.aprs_msg_to_edit = h.payload;
+                if (hs.aprs) {
+                    for (const auto& s : hs.aprs->stations()) {
+                        if (h.payload == s.callsign_ssid && s.has_position) {
+                            hs.gt_map_nx = (s.longitude + 180.0) / 360.0;
+                            double rlat = std::clamp(s.latitude, -85.0, 85.0) * 3.14159265358979323846 / 180.0;
+                            hs.gt_map_ny = (1.0 - std::log(std::tan(rlat) + 1.0 / std::cos(rlat)) / 3.14159265358979323846) / 2.0;
+                            hs.gt_map_zoom = std::max(hs.gt_map_zoom, 7);
+                            break;
+                        }
+                    }
+                }
+                return true;
+            }
+
+            // SSTV Tab Controls (RX + TX Studio)
+            case HS_SSTV_AUTO_VIS_TOG:
+                if (hs.sstv) {
+                    bool nxt = !hs.sstv->telemetry().auto_vis_enabled;
+                    hs.sstv->set_mode_override(nxt, hs.sstv_manual_mode);
+                }
+                return true;
+            case HS_SSTV_RX_MODE_PREV:
+                if (hs.sstv) {
+                    int m = (static_cast<int>(hs.sstv_manual_mode) + static_cast<int>(hamshack::carbon::kNumSstvModes) - 1) %
+                            static_cast<int>(hamshack::carbon::kNumSstvModes);
+                    hs.sstv_manual_mode = static_cast<hamshack::carbon::SstvMode>(m);
+                    hs.sstv->set_mode_override(hs.sstv->telemetry().auto_vis_enabled, hs.sstv_manual_mode);
+                }
+                return true;
+            case HS_SSTV_RX_MODE_NEXT:
+                if (hs.sstv) {
+                    int m = (static_cast<int>(hs.sstv_manual_mode) + 1) % static_cast<int>(hamshack::carbon::kNumSstvModes);
+                    hs.sstv_manual_mode = static_cast<hamshack::carbon::SstvMode>(m);
+                    hs.sstv->set_mode_override(hs.sstv->telemetry().auto_vis_enabled, hs.sstv_manual_mode);
+                }
+                return true;
+            case HS_SSTV_FORCE_RX:
+                if (hs.sstv) {
+                    hs.sstv->force_start_manual_rx(hs.sstv_manual_mode);
+                    hs.sstv_status_banner = "Forced RX Scanline Sync: " + std::string(hamshack::carbon::sstv_mode_spec(hs.sstv_manual_mode).name);
+                }
+                return true;
+            case HS_SSTV_SLANT_M10:  if (hs.sstv) hs.sstv->adjust_slant_ppm(-50.0f); return true;
+            case HS_SSTV_SLANT_M1:   if (hs.sstv) hs.sstv->adjust_slant_ppm(-5.0f);  return true;
+            case HS_SSTV_SLANT_ZERO: if (hs.sstv) hs.sstv->set_slant_ppm(0.0f);      return true;
+            case HS_SSTV_SLANT_P1:   if (hs.sstv) hs.sstv->adjust_slant_ppm(+5.0f);  return true;
+            case HS_SSTV_SLANT_P10:  if (hs.sstv) hs.sstv->adjust_slant_ppm(+50.0f); return true;
+            case HS_SSTV_CLEAR_RX:   if (hs.sstv) hs.sstv->clear_rx_canvas();        return true;
+            case HS_SSTV_AUTOSAVE_TOG:
+                if (hs.sstv) {
+                    bool nxt = !hs.sstv->telemetry().auto_save_png;
+                    hs.sstv->set_auto_save_png(nxt);
+                    auto& cfg = hamshack::get_app_config();
+                    cfg.sstv_auto_save = nxt;
+                    cfg.save();
+                }
+                return true;
+            case HS_SSTV_SAVE_NOW:
+                if (hs.sstv) {
+                    std::string p;
+                    bool ok = hs.sstv->save_current_rx_png(p);
+                    hs.sstv_status_banner = (!ok || p.empty()) ? "PNG save failed" : ("Saved PNG: " + p);
+                }
+                return true;
+            case HS_SSTV_VIEW_CYCLE:
+                hs.sstv_canvas_layout = (hs.sstv_canvas_layout + 1) % 3;
+                return true;
+            case HS_SSTV_TX_MODE_PREV:
+                if (hs.sstv) {
+                    int m = (static_cast<int>(hs.sstv->telemetry().tx_mode) + static_cast<int>(hamshack::carbon::kNumSstvModes) - 1) %
+                            static_cast<int>(hamshack::carbon::kNumSstvModes);
+                    hs.sstv->set_tx_mode(static_cast<hamshack::carbon::SstvMode>(m));
+                }
+                return true;
+            case HS_SSTV_TX_MODE_NEXT:
+                if (hs.sstv) {
+                    int m = (static_cast<int>(hs.sstv->telemetry().tx_mode) + 1) % static_cast<int>(hamshack::carbon::kNumSstvModes);
+                    hs.sstv->set_tx_mode(static_cast<hamshack::carbon::SstvMode>(m));
+                }
+                return true;
+            case HS_SSTV_LOAD_IMG: {
+                if (hs.sstv) {
+                    std::wstring wpath = meshirc::open_image_file_dialog(hwnd);
+                    if (!wpath.empty()) {
+                        std::string err_msg;
+                        if (hs.sstv->load_tx_image_file(wpath, err_msg)) {
+                            hs.sstv_status_banner = "Loaded TX Image: " + std::filesystem::path(wpath).filename().string();
+                        } else {
+                            hs.sstv_status_banner = err_msg.empty() ? "Failed to decode image (use PNG/JPEG/BMP)" : err_msg;
+                        }
+                    }
+                }
+                return true;
+            }
+            case HS_SSTV_TEST_CARD:
+                if (hs.sstv) {
+                    hs.sstv->generate_default_test_card();
+                    hs.sstv_status_banner = "Loaded SMPTE Color-Bar Test Card";
+                }
+                return true;
+            case HS_SSTV_DITHER_TOG:
+                if (hs.sstv) {
+                    hs.sstv->set_tx_dither_1bit(!hs.sstv->telemetry().tx_dither_1bit);
+                }
+                return true;
+            case HS_SSTV_OVERLAY_BOX:
+                hs.text_focus = HsTextFocus::SstvOverlay;
+                return true;
+            case HS_SSTV_SEND_TX:
+                if (hs.sstv) {
+                    if (hs.sstv->start_transmit()) {
+                        hs.sstv_status_banner = "Transmitting " + std::string(hamshack::carbon::sstv_mode_spec(hs.sstv->telemetry().tx_mode).name) + " (48 kHz PCM)";
+                    }
+                }
+                return true;
+            case HS_SSTV_ABORT_TX:
+                if (hs.sstv) {
+                    hs.sstv->abort_transmit();
+                    hs.sstv_status_banner = "TX Aborted cleanly (1.5 ms cosine ramp-down)";
+                }
+                return true;
 
             case HS_MODE_SET_LSB: hs.flrig.set_mode(hamshack::RigMode::LSB); return true;
             case HS_MODE_SET_USB: hs.flrig.set_mode(hamshack::RigMode::USB); return true;
@@ -5101,6 +6266,13 @@ inline bool handle_hamshack_key_char(HamShackSuite& hs, char c) {
         case HsTextFocus::LogQsoComm:  target = &hs.log_qso_dialog.comments; max_len = 120; force_upper = false; break;
         case HsTextFocus::TwitchChannel:   target = &cfg.twitch_channel; max_len = 32; force_upper = false; break;
         case HsTextFocus::TwitchStreamKey: target = &cfg.twitch_stream_key; max_len = 64; force_upper = false; break;
+        case HsTextFocus::AprsHost:        target = &hs.aprs_host_edit; max_len = 64; force_upper = false; break;
+        case HsTextFocus::AprsPort:        target = &hs.aprs_port_edit; max_len = 6;  force_upper = false; break;
+        case HsTextFocus::AprsPath:        target = &hs.aprs_path_edit; max_len = 40; force_upper = true;  break;
+        case HsTextFocus::AprsComment:     target = &hs.aprs_comment_edit; max_len = 43; force_upper = false; break;
+        case HsTextFocus::AprsMsgTo:       target = &hs.aprs_msg_to_edit; max_len = 9; force_upper = true; break;
+        case HsTextFocus::AprsMsgText:     target = &hs.aprs_msg_text_edit; max_len = 67; force_upper = false; break;
+        case HsTextFocus::SstvOverlay:     target = &hs.sstv_overlay_edit; max_len = 40; force_upper = false; break;
         default: return false;
     }
     if (!target) return false;
@@ -5190,6 +6362,29 @@ inline bool handle_hamshack_key_char(HamShackSuite& hs, char c) {
             hs.twitch.stream_key = cfg.twitch_stream_key;
             cfg.save();
             hs.text_focus = HsTextFocus::None;
+        } else if (hs.text_focus == HsTextFocus::AprsMsgText) {
+            if (hs.aprs && !hs.aprs_msg_to_edit.empty() && !hs.aprs_msg_text_edit.empty()) {
+                hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                hs.aprs->send_text_message(hs.aprs_msg_to_edit, hs.aprs_msg_text_edit);
+                hs.aprs_msg_text_edit.clear();
+            }
+        } else if (hs.text_focus == HsTextFocus::AprsMsgTo) {
+            hs.text_focus = HsTextFocus::AprsMsgText;
+        } else if (hs.text_focus == HsTextFocus::AprsHost || hs.text_focus == HsTextFocus::AprsPort ||
+                   hs.text_focus == HsTextFocus::AprsPath || hs.text_focus == HsTextFocus::AprsComment ||
+                   hs.text_focus == HsTextFocus::SstvOverlay) {
+            auto& cfg = hamshack::get_app_config();
+            cfg.aprs_kiss_host = hs.aprs_host_edit;
+            cfg.aprs_kiss_port = std::clamp(std::atoi(hs.aprs_port_edit.c_str()), 1, 65535);
+            cfg.aprs_digi_path = hs.aprs_path_edit;
+            cfg.aprs_beacon_comment = hs.aprs_comment_edit;
+            cfg.sstv_overlay_text = hs.sstv_overlay_edit;
+            if (hs.aprs) {
+                hs.aprs->set_station_identity(hs.hf_callsign, static_cast<uint8_t>(hs.aprs_ssid), hs.aprs_path_edit);
+                hs.aprs->set_kiss_endpoint(hs.aprs_host_edit, static_cast<uint16_t>(cfg.aprs_kiss_port));
+            }
+            cfg.save();
+            hs.text_focus = HsTextFocus::None;
         }
     } else if (c >= 0x20 && c < 0x7F && target->size() < max_len) {
         char out_c = force_upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
@@ -5225,6 +6420,12 @@ inline bool handle_hamshack_key_char(HamShackSuite& hs, char c) {
         auto& cfg = hamshack::get_app_config();
         hs.twitch.channel_name = cfg.twitch_channel;
         hs.twitch.stream_key = cfg.twitch_stream_key;
+        cfg.save();
+    }
+    if (hs.text_focus == HsTextFocus::SstvOverlay && hs.sstv) {
+        hs.sstv->set_tx_overlay_text(hs.sstv_overlay_edit);
+        auto& cfg = hamshack::get_app_config();
+        cfg.sstv_overlay_text = hs.sstv_overlay_edit;
         cfg.save();
     }
     return true;

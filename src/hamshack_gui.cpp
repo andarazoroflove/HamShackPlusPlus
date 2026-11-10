@@ -3944,6 +3944,7 @@ public:
         std::string band_label;
     };
     uint64_t wf_tex_seq = 0;
+    int wf_tex_width = 0;
     int wf_tex_rows = 0;
     int wf_tex_scheme = -1;
     bool wf_tex_light = false;
@@ -3955,6 +3956,19 @@ public:
 #elif defined(__APPLE__)
     ID2D1Bitmap* wf_mac_bmp = nullptr;
 #endif
+
+    // Zero-allocation GPU surface slots for Carbon Engine progressive SSTV scanlines & waterfall
+    struct CarbonGpuSurfaceSlot {
+        int w = 0;
+        int h = 0;
+        uint64_t seq = 0;
+#ifdef _WIN32
+        ID2D1Bitmap* bmp = nullptr;
+#elif defined(__APPLE__)
+        ID2D1Bitmap mac_bmp{nullptr};
+#endif
+    };
+    std::array<CarbonGpuSurfaceSlot, 4> carbon_surfaces_{};
 
 #ifdef _WIN32
     // Device-independent DirectWrite text layout cache (eliminates ~42,000 glyph-shaping passes/sec at 60 FPS)
@@ -4025,13 +4039,31 @@ public:
             mono_bitmap->Release();
             mono_bitmap = nullptr;
         }
+        for (auto& s : carbon_surfaces_) {
+            if (s.bmp) {
+                s.bmp->Release();
+                s.bmp = nullptr;
+            }
+            s.w = s.h = 0;
+            s.seq = 0;
+        }
 #elif defined(__APPLE__)
         if (wf_mac_bmp) {
             wf_mac_bmp->Release();
             wf_mac_bmp = nullptr;
         }
+        for (auto& s : carbon_surfaces_) {
+            if (s.mac_bmp.image) {
+                CGImageRelease(s.mac_bmp.image);
+                s.mac_bmp.image = nullptr;
+            }
+            s.w = s.h = 0;
+            s.seq = 0;
+        }
 #endif
         wf_tex_seq = 0;
+        wf_tex_width = 0;
+        wf_tex_rows = 0;
         resource_owner_rt = nullptr;
     }
 
@@ -4374,13 +4406,14 @@ public:
         }
     }
 
-    bool is_waterfall_cache_valid(uint64_t seq, int scheme) const {
+    bool is_waterfall_cache_valid(uint64_t seq, int scheme, int width) const {
 #ifdef _WIN32
         bool has_tex = (wf_bitmap != nullptr);
 #elif defined(__APPLE__)
         bool has_tex = (wf_mac_bmp != nullptr);
 #endif
-        return has_tex && seq != 0 && wf_tex_seq == seq && wf_tex_scheme == scheme && wf_tex_light == light_mode;
+        return has_tex && seq != 0 && wf_tex_seq == seq && wf_tex_width == width &&
+               wf_tex_scheme == scheme && wf_tex_light == light_mode;
     }
 
     void update_waterfall_texture(int width, int n_rows, const uint8_t* bytes, uint64_t seq, int scheme) {
@@ -4392,10 +4425,19 @@ public:
         if (n_rows <= 0 || !bytes) return;
 #ifdef _WIN32
         constexpr int MAX_WF_ROWS = 300;
+        if (wf_bitmap && wf_tex_width != width) {
+            wf_bitmap->Release();
+            wf_bitmap = nullptr;
+        }
         if (!wf_bitmap) {
             D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
-            rt->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), MAX_WF_ROWS), nullptr, 0, &props, &wf_bitmap);
+            std::vector<uint8_t> zero_init(static_cast<size_t>(width) * MAX_WF_ROWS * 4u, 0u);
+            if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), MAX_WF_ROWS),
+                                           zero_init.data(), static_cast<UINT32>(width * 4),
+                                           &props, &wf_bitmap)) && wf_bitmap) {
+                wf_tex_width = width;
+            }
         }
         if (wf_bitmap) {
             int copy_rows = std::min(n_rows, MAX_WF_ROWS);
@@ -4409,14 +4451,19 @@ public:
         }
         static CGColorSpaceRef s_wf_cs = CGColorSpaceCreateDeviceRGB();
         if (s_wf_cs) {
+            // Native 32-bit little-endian premultiplied BGRA32:
+            // kCGImageAlphaPremultipliedFirst (2) | kCGBitmapByteOrder32Little (2 << 12)
             CGContextRef bctx = CGBitmapContextCreate(const_cast<uint8_t*>(bytes),
                                                       static_cast<size_t>(width),
                                                       static_cast<size_t>(n_rows),
                                                       8, static_cast<size_t>(width * 4), s_wf_cs,
-                                                      1u | (3u << 12));
+                                                      2u | (2u << 12));
             if (bctx) {
                 CGImageRef cg_img = CGBitmapContextCreateImage(bctx);
-                if (cg_img) wf_mac_bmp = new ID2D1Bitmap(cg_img);
+                if (cg_img) {
+                    wf_mac_bmp = new ID2D1Bitmap(cg_img);
+                    wf_tex_width = width;
+                }
                 CGContextRelease(bctx);
             }
         }
@@ -4428,13 +4475,86 @@ public:
         float row_h = wf_h / static_cast<float>(std::max(16, wf_tex_rows));
         D2D1_RECT_F dst = D2D1::RectF(plot_x, wf_y, plot_x + plot_w, wf_y + wf_tex_rows * row_h);
         D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(wf_tex_rows));
+        const auto interp = (row_h >= 2.0f)
+            ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+            : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
 #ifdef _WIN32
         if (wf_bitmap) {
-            rt->DrawBitmap(wf_bitmap, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+            rt->DrawBitmap(wf_bitmap, dst, 1.0f, interp, &src);
         }
 #elif defined(__APPLE__)
         if (wf_mac_bmp) {
-            rt->DrawBitmap(wf_mac_bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+            rt->DrawBitmap(wf_mac_bmp, dst, 1.0f, interp, &src);
+        }
+#endif
+    }
+
+    void draw_bgra_surface(int slot_idx,
+                           const uint32_t* bgra_pixels,
+                           int w,
+                           int h,
+                           int stride_px,
+                           uint64_t seq,
+                           const D2D1_RECT_F& dst,
+                           bool nearest = false) {
+        if (!rt || !bgra_pixels || w <= 0 || h <= 0 || stride_px < w) return;
+        if (slot_idx < 0 || slot_idx >= static_cast<int>(carbon_surfaces_.size())) return;
+        auto& slot = carbon_surfaces_[static_cast<size_t>(slot_idx)];
+        const auto interp = nearest ? D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR
+                                    : D2D1_BITMAP_INTERPOLATION_MODE_LINEAR;
+#ifdef _WIN32
+        if (!slot.bmp || slot.w != w || slot.h != h) {
+            if (slot.bmp) {
+                slot.bmp->Release();
+                slot.bmp = nullptr;
+            }
+            D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+            if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(w), static_cast<UINT32>(h)),
+                                           nullptr, 0, &props, &slot.bmp)) && slot.bmp) {
+                slot.w = w;
+                slot.h = h;
+                slot.seq = 0;
+            }
+        }
+        if (slot.bmp && (slot.seq != seq || seq == 0)) {
+            D2D1_RECT_U dst_u = D2D1::RectU(0, 0, static_cast<UINT32>(w), static_cast<UINT32>(h));
+            slot.bmp->CopyFromMemory(&dst_u, bgra_pixels, static_cast<UINT32>(stride_px * 4));
+            slot.seq = seq;
+        }
+        if (slot.bmp) {
+            D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
+            rt->DrawBitmap(slot.bmp, dst, 1.0f, interp, &src);
+        }
+#elif defined(__APPLE__)
+        if (!slot.mac_bmp.image || slot.w != w || slot.h != h || slot.seq != seq || seq == 0) {
+            if (slot.mac_bmp.image) {
+                CGImageRelease(slot.mac_bmp.image);
+                slot.mac_bmp.image = nullptr;
+            }
+            static CGColorSpaceRef s_carbon_cs = CGColorSpaceCreateDeviceRGB();
+            if (s_carbon_cs) {
+                // kCGBitmapByteOrder32Little (2 << 12) | kCGImageAlphaNoneSkipFirst (6)
+                CGContextRef bctx = CGBitmapContextCreate(
+                    const_cast<uint32_t*>(bgra_pixels),
+                    static_cast<size_t>(w),
+                    static_cast<size_t>(h),
+                    8,
+                    static_cast<size_t>(stride_px * 4),
+                    s_carbon_cs,
+                    6u | (2u << 12));
+                if (bctx) {
+                    slot.mac_bmp.image = CGBitmapContextCreateImage(bctx);
+                    CGContextRelease(bctx);
+                    slot.w = w;
+                    slot.h = h;
+                    slot.seq = seq;
+                }
+            }
+        }
+        if (slot.mac_bmp.image) {
+            D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(w), static_cast<float>(h));
+            rt->DrawBitmap(&slot.mac_bmp, dst, 1.0f, interp, &src);
         }
 #endif
     }
@@ -4868,6 +4988,10 @@ public:
                 hamshack_ui::render_winlink_workspace(*this, app, *g_hs, app.mouse_pt, wx, pane_top, ww, pane_h);
             } else if (g_hs->active_mode_tab == 8) {
                 hamshack_ui::render_configuration_workspace(*this, app, *g_hs, app.mouse_pt, wx, pane_top, ww, pane_h);
+            } else if (g_hs->active_mode_tab == 9) {
+                hamshack_ui::render_aprs_workspace(*this, app, *g_hs, app.mouse_pt, wx, pane_top, ww, pane_h);
+            } else if (g_hs->active_mode_tab == 10) {
+                hamshack_ui::render_sstv_workspace(*this, app, *g_hs, app.mouse_pt, wx, pane_top, ww, pane_h);
             }
             if (app.serial_dropdown_open || app.ble_dropdown_open) {
                 hamshack_web::get_web_maps().hide_all();
@@ -7096,8 +7220,8 @@ static void handle_left_click(HWND hwnd, POINT pt) {
         g_app->ble_dropdown_open = false;
     }
 
-    // 1c. Check HamShack++ Top FLRig Deck, 5-Mode Tab Bar, and FT8/JS8/CW/FLRig controls
-    if (g_hs && hamshack_ui::handle_hamshack_mouse_down(*g_app, *g_hs, pt)) {
+    // 1c. Check HamShack++ Top FLRig Deck, Global Tab Bar, and FT8/JS8/CW/APRS/SSTV/FLRig controls
+    if (g_hs && hamshack_ui::handle_hamshack_mouse_down(*g_app, *g_hs, pt, hwnd)) {
         return;
     }
 
@@ -7618,7 +7742,10 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                 bool wf_advanced = (cur_wf_seq != g_last_wf_seq_seen);
                 g_last_wf_seq_seen = cur_wf_seq;
 
-                bool needs_60fps = recent_input || wf_advanced || g_app->is_sim ||
+                bool sstv_busy = g_hs && g_hs->sstv &&
+                    (g_hs->sstv->telemetry().tx_active ||
+                     g_hs->sstv->telemetry().rx_state == hamshack::carbon::SstvRxState::ReceivingImage);
+                bool needs_60fps = recent_input || wf_advanced || g_app->is_sim || sstv_busy ||
                     (g_hs && (g_hs->twitch.is_streaming.load(std::memory_order_relaxed) ||
                               g_hs->ft8.transmitting_now ||
                               g_hs->ft8.decode_in_progress.load(std::memory_order_relaxed) ||
@@ -7626,7 +7753,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
                 int active_tab = g_hs ? g_hs->active_mode_tab : 3;
                 ULONGLONG min_interval_ms = needs_60fps ? 0ULL
-                                          : (active_tab == 0 || active_tab == 1 || active_tab == 2) ? 33ULL // 30 Hz slot progress when audio idle
+                                          : (active_tab == 0 || active_tab == 1 || active_tab == 2 ||
+                                             active_tab == 9 || active_tab == 10) ? 33ULL // 30 Hz live DSP/map refresh
                                           : 100ULL; // 10 Hz low-power refresh on static tabs (IRC/Winlink/Pages/Config/idle Mesh)
                 if (now_ms - g_last_paint_tick >= min_interval_ms) {
                     InvalidateRect(hwnd, nullptr, FALSE);
@@ -7860,7 +7988,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_MOUSEWHEEL:
-            if (g_hs && g_hs->active_mode_tab == 4 &&
+            if (g_hs && (g_hs->active_mode_tab == 4 || g_hs->active_mode_tab == 9) &&
                 D2DRenderer::pt_in_rect(g_app->mouse_pt, g_hs->gt_map_rect)) {
                 int delta = GET_WHEEL_DELTA_WPARAM(wParam);
                 if (delta > 0) g_hs->gt_map_zoom = std::min(10, g_hs->gt_map_zoom + 1);
