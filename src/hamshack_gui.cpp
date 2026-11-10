@@ -3921,8 +3921,54 @@ class D2DRenderer {
 public:
     ID2D1Factory* d2d_factory = nullptr;
     IDWriteFactory* dwrite_factory = nullptr;
-    ID2D1DCRenderTarget* rt = nullptr;
+    ID2D1RenderTarget* rt = nullptr;
+#ifdef _WIN32
+    ID2D1HwndRenderTarget* hwnd_rt = nullptr;
+    HWND hwnd_rt_owner = nullptr;
+    ID2D1DCRenderTarget* dc_rt = nullptr;
+    HDC cached_mem_dc = nullptr;
+    HBITMAP cached_dib_bmp = nullptr;
+    HGDIOBJ cached_old_bmp = nullptr;
+    int cached_dib_w = 0;
+    int cached_dib_h = 0;
+#elif defined(__APPLE__)
+    ID2D1DCRenderTarget* dc_rt = nullptr;
+#endif
+    ID2D1RenderTarget* resource_owner_rt = nullptr;
+    ID2D1SolidColorBrush* shared_brush = nullptr;
     bool light_mode = false;
+
+    // Persistent streaming waterfall GPU texture & interval metadata
+    struct WfIntervalMark {
+        int row_idx = 0;
+        std::string band_label;
+    };
+    uint64_t wf_tex_seq = 0;
+    int wf_tex_rows = 0;
+    int wf_tex_scheme = -1;
+    bool wf_tex_light = false;
+    std::vector<uint8_t> wf_pixel_bytes;
+    std::vector<WfIntervalMark> wf_intervals;
+#ifdef _WIN32
+    ID2D1Bitmap* wf_bitmap = nullptr;
+    ID2D1Bitmap* mono_bitmap = nullptr;
+#elif defined(__APPLE__)
+    ID2D1Bitmap* wf_mac_bmp = nullptr;
+#endif
+
+#ifdef _WIN32
+    // Device-independent DirectWrite text layout cache (eliminates ~42,000 glyph-shaping passes/sec at 60 FPS)
+    struct CachedTextLayout {
+        IDWriteTextFormat* fmt = nullptr;
+        DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING;
+        int w_half_px = 0;
+        int h_half_px = 0;
+        std::string text;
+        IDWriteTextLayout* layout = nullptr;
+        uint64_t last_frame = 0;
+    };
+    std::unordered_map<uint64_t, CachedTextLayout> text_layout_cache;
+#endif
 
     IDWriteTextFormat* font_title = nullptr;
     IDWriteTextFormat* font_ui = nullptr;
@@ -3962,6 +4008,31 @@ public:
             g_tiles.forget(kv.first);
         }
         tile_bitmaps.clear();
+    }
+
+    void release_device_resources() {
+        release_tiles();
+        if (shared_brush) {
+            shared_brush->Release();
+            shared_brush = nullptr;
+        }
+#ifdef _WIN32
+        if (wf_bitmap) {
+            wf_bitmap->Release();
+            wf_bitmap = nullptr;
+        }
+        if (mono_bitmap) {
+            mono_bitmap->Release();
+            mono_bitmap = nullptr;
+        }
+#elif defined(__APPLE__)
+        if (wf_mac_bmp) {
+            wf_mac_bmp->Release();
+            wf_mac_bmp = nullptr;
+        }
+#endif
+        wf_tex_seq = 0;
+        resource_owner_rt = nullptr;
     }
 
     ID2D1Bitmap* decode_png(const std::vector<uint8_t>& bytes) {
@@ -4030,7 +4101,8 @@ public:
 #elif defined(__APPLE__)
         d2d_factory = new ID2D1Factory();
         dwrite_factory = new IDWriteFactory();
-        rt = new ID2D1DCRenderTarget();
+        dc_rt = new ID2D1DCRenderTarget();
+        rt = dc_rt;
 #endif
 
         if (dwrite_factory) {
@@ -4062,6 +4134,27 @@ public:
     }
 
     ~D2DRenderer() {
+        release_device_resources();
+#ifdef _WIN32
+        for (auto& kv : text_layout_cache) {
+            if (kv.second.layout) kv.second.layout->Release();
+        }
+        text_layout_cache.clear();
+        if (cached_mem_dc) {
+            if (cached_old_bmp) SelectObject(cached_mem_dc, cached_old_bmp);
+            if (cached_dib_bmp) DeleteObject(cached_dib_bmp);
+            DeleteDC(cached_mem_dc);
+            cached_mem_dc = nullptr;
+            cached_dib_bmp = nullptr;
+            cached_old_bmp = nullptr;
+        }
+        if (hwnd_rt) { hwnd_rt->Release(); hwnd_rt = nullptr; }
+        if (dc_rt) { dc_rt->Release(); dc_rt = nullptr; }
+        rt = nullptr;
+#elif defined(__APPLE__)
+        if (dc_rt) { dc_rt->Release(); dc_rt = nullptr; }
+        rt = nullptr;
+#endif
         if (font_title) font_title->Release();
         if (font_ui) font_ui->Release();
         if (font_ui_bold) font_ui_bold->Release();
@@ -4072,35 +4165,126 @@ public:
             if (kv.second) kv.second->Release();
         }
         scaled_mono_fonts.clear();
-        for (auto& kv : tile_bitmaps) if (kv.second.bmp) kv.second.bmp->Release();
-        tile_bitmaps.clear();
         if (wic) wic->Release();
-        if (rt) rt->Release();
         if (dwrite_factory) dwrite_factory->Release();
         if (d2d_factory) d2d_factory->Release();
     }
 
-    void ensure_target() {
+    void ensure_dc_target() {
 #ifdef _WIN32
-        if (!rt && d2d_factory) {
+        if (!dc_rt && d2d_factory) {
             D2D1_RENDER_TARGET_PROPERTIES props = D2D1::RenderTargetProperties(
                 D2D1_RENDER_TARGET_TYPE_DEFAULT,
                 D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
                 96.0f, 96.0f,
                 D2D1_RENDER_TARGET_USAGE_NONE,
                 D2D1_FEATURE_LEVEL_DEFAULT);
-            d2d_factory->CreateDCRenderTarget(&props, &rt);
-            if (rt) {
-                rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
-                rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+            d2d_factory->CreateDCRenderTarget(&props, &dc_rt);
+            if (dc_rt) {
+                dc_rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                dc_rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
             }
         }
 #elif defined(__APPLE__)
-        if (!rt) rt = new ID2D1DCRenderTarget();
+        if (!dc_rt) dc_rt = new ID2D1DCRenderTarget();
 #endif
     }
 
-    void resize(UINT, UINT) {}
+#ifdef _WIN32
+    void ensure_hwnd_target(HWND hwnd, int w_px, int h_px) {
+        if (hwnd_rt && hwnd_rt_owner != hwnd) {
+            release_device_resources();
+            hwnd_rt->Release();
+            hwnd_rt = nullptr;
+        }
+        if (!hwnd_rt && d2d_factory && hwnd && w_px > 0 && h_px > 0) {
+            D2D1_RENDER_TARGET_PROPERTIES rt_props = D2D1::RenderTargetProperties(
+                D2D1_RENDER_TARGET_TYPE_DEFAULT,
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE),
+                96.0f, 96.0f,
+                D2D1_RENDER_TARGET_USAGE_NONE,
+                D2D1_FEATURE_LEVEL_DEFAULT);
+            D2D1_HWND_RENDER_TARGET_PROPERTIES hwnd_props = D2D1::HwndRenderTargetProperties(
+                hwnd,
+                D2D1::SizeU(static_cast<UINT32>(w_px), static_cast<UINT32>(h_px)),
+                D2D1_PRESENT_OPTIONS_IMMEDIATELY);
+            if (SUCCEEDED(d2d_factory->CreateHwndRenderTarget(rt_props, hwnd_props, &hwnd_rt)) && hwnd_rt) {
+                hwnd_rt_owner = hwnd;
+                hwnd_rt->SetAntialiasMode(D2D1_ANTIALIAS_MODE_PER_PRIMITIVE);
+                hwnd_rt->SetTextAntialiasMode(D2D1_TEXT_ANTIALIAS_MODE_CLEARTYPE);
+            }
+        } else if (hwnd_rt && w_px > 0 && h_px > 0) {
+            D2D1_SIZE_U cur = hwnd_rt->GetPixelSize();
+            if (cur.width != static_cast<UINT32>(w_px) || cur.height != static_cast<UINT32>(h_px)) {
+                hwnd_rt->Resize(D2D1::SizeU(static_cast<UINT32>(w_px), static_cast<UINT32>(h_px)));
+            }
+        }
+    }
+
+    bool ensure_cached_dib(HDC ref_dc, int w_px, int h_px) {
+        if (cached_mem_dc && cached_dib_bmp && cached_dib_w == w_px && cached_dib_h == h_px) {
+            return true;
+        }
+        if (cached_mem_dc) {
+            if (cached_old_bmp) SelectObject(cached_mem_dc, cached_old_bmp);
+            if (cached_dib_bmp) DeleteObject(cached_dib_bmp);
+            cached_dib_bmp = nullptr;
+            cached_old_bmp = nullptr;
+        } else {
+            cached_mem_dc = CreateCompatibleDC(ref_dc);
+            if (!cached_mem_dc) return false;
+        }
+        BITMAPINFO dib_bmi{};
+        dib_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
+        dib_bmi.bmiHeader.biWidth       = w_px;
+        dib_bmi.bmiHeader.biHeight      = -h_px;
+        dib_bmi.bmiHeader.biPlanes      = 1;
+        dib_bmi.bmiHeader.biBitCount    = 32;
+        dib_bmi.bmiHeader.biCompression = BI_RGB;
+        void* dib_bits = nullptr;
+        cached_dib_bmp = CreateDIBSection(cached_mem_dc, &dib_bmi, DIB_RGB_COLORS, &dib_bits, nullptr, 0);
+        if (!cached_dib_bmp) {
+            cached_dib_w = cached_dib_h = 0;
+            return false;
+        }
+        cached_old_bmp = SelectObject(cached_mem_dc, cached_dib_bmp);
+        cached_dib_w = w_px;
+        cached_dib_h = h_px;
+        return true;
+    }
+#endif
+
+    void bind_resource_owner(ID2D1RenderTarget* active_rt) {
+        rt = active_rt;
+        if (!rt) return;
+        if (resource_owner_rt != rt) {
+            release_device_resources();
+            resource_owner_rt = rt;
+        }
+        if (!shared_brush) {
+            rt->CreateSolidColorBrush(D2D1::ColorF(1.0f, 1.0f, 1.0f, 1.0f), &shared_brush);
+        }
+    }
+
+    ID2D1SolidColorBrush* brush(D2D1_COLOR_F color) {
+        if (!shared_brush && rt) {
+            rt->CreateSolidColorBrush(color, &shared_brush);
+        }
+        if (shared_brush) {
+            shared_brush->SetColor(color);
+        }
+        return shared_brush;
+    }
+
+    void resize(UINT w, UINT h) {
+#ifdef _WIN32
+        if (hwnd_rt && w > 0 && h > 0) {
+            hwnd_rt->Resize(D2D1::SizeU(w, h));
+        }
+#else
+        (void)w; (void)h;
+#endif
+    }
 
     D2D1_COLOR_F hex_color(uint32_t rgb, float alpha = 1.0f) const {
         if (light_mode) {
@@ -4158,22 +4342,101 @@ public:
         return pt.x >= r.left && pt.x <= r.right && pt.y >= r.top && pt.y <= r.bottom;
     }
 
+    void fill_rect(const D2D1_RECT_F& r, D2D1_COLOR_F color) {
+        if (ID2D1SolidColorBrush* b = brush(color)) {
+            rt->FillRectangle(r, b);
+        }
+    }
+
+    void draw_line(D2D1_POINT_2F p0, D2D1_POINT_2F p1, D2D1_COLOR_F color, float stroke = 1.0f) {
+        if (ID2D1SolidColorBrush* b = brush(color)) {
+            rt->DrawLine(p0, p1, b, stroke);
+        }
+    }
+
     void fill_round_rect(const D2D1_RECT_F& r, float radius, D2D1_COLOR_F color) {
-        ID2D1SolidColorBrush* b = nullptr;
-        rt->CreateSolidColorBrush(color, &b);
-        if (b) {
-            rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), b);
-            b->Release();
+        if (ID2D1SolidColorBrush* b = brush(color)) {
+            if (radius <= 0.25f) {
+                rt->FillRectangle(r, b);
+            } else {
+                rt->FillRoundedRectangle(D2D1::RoundedRect(r, radius, radius), b);
+            }
         }
     }
 
     void draw_round_rect(const D2D1_RECT_F& r, float radius, D2D1_COLOR_F color, float stroke = 1.0f) {
-        ID2D1SolidColorBrush* b = nullptr;
-        rt->CreateSolidColorBrush(color, &b);
-        if (b) {
-            rt->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), b, stroke);
-            b->Release();
+        if (ID2D1SolidColorBrush* b = brush(color)) {
+            if (radius <= 0.25f) {
+                rt->DrawRectangle(r, b, stroke);
+            } else {
+                rt->DrawRoundedRectangle(D2D1::RoundedRect(r, radius, radius), b, stroke);
+            }
         }
+    }
+
+    bool is_waterfall_cache_valid(uint64_t seq, int scheme) const {
+#ifdef _WIN32
+        bool has_tex = (wf_bitmap != nullptr);
+#elif defined(__APPLE__)
+        bool has_tex = (wf_mac_bmp != nullptr);
+#endif
+        return has_tex && seq != 0 && wf_tex_seq == seq && wf_tex_scheme == scheme && wf_tex_light == light_mode;
+    }
+
+    void update_waterfall_texture(int width, int n_rows, const uint8_t* bytes, uint64_t seq, int scheme) {
+        if (!rt || width <= 0) return;
+        wf_tex_seq = seq;
+        wf_tex_rows = n_rows;
+        wf_tex_scheme = scheme;
+        wf_tex_light = light_mode;
+        if (n_rows <= 0 || !bytes) return;
+#ifdef _WIN32
+        constexpr int MAX_WF_ROWS = 300;
+        if (!wf_bitmap) {
+            D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_PREMULTIPLIED), 96.0f, 96.0f);
+            rt->CreateBitmap(D2D1::SizeU(static_cast<UINT32>(width), MAX_WF_ROWS), nullptr, 0, &props, &wf_bitmap);
+        }
+        if (wf_bitmap) {
+            int copy_rows = std::min(n_rows, MAX_WF_ROWS);
+            D2D1_RECT_U dst_u = D2D1::RectU(0, 0, static_cast<UINT32>(width), static_cast<UINT32>(copy_rows));
+            wf_bitmap->CopyFromMemory(&dst_u, bytes, static_cast<UINT32>(width * 4));
+        }
+#elif defined(__APPLE__)
+        if (wf_mac_bmp) {
+            wf_mac_bmp->Release();
+            wf_mac_bmp = nullptr;
+        }
+        static CGColorSpaceRef s_wf_cs = CGColorSpaceCreateDeviceRGB();
+        if (s_wf_cs) {
+            CGContextRef bctx = CGBitmapContextCreate(const_cast<uint8_t*>(bytes),
+                                                      static_cast<size_t>(width),
+                                                      static_cast<size_t>(n_rows),
+                                                      8, static_cast<size_t>(width * 4), s_wf_cs,
+                                                      1u | (3u << 12));
+            if (bctx) {
+                CGImageRef cg_img = CGBitmapContextCreateImage(bctx);
+                if (cg_img) wf_mac_bmp = new ID2D1Bitmap(cg_img);
+                CGContextRelease(bctx);
+            }
+        }
+#endif
+    }
+
+    void draw_waterfall_texture(float plot_x, float wf_y, float plot_w, float wf_h, int width) {
+        if (!rt || wf_tex_rows <= 0 || width <= 0) return;
+        float row_h = wf_h / static_cast<float>(std::max(16, wf_tex_rows));
+        D2D1_RECT_F dst = D2D1::RectF(plot_x, wf_y, plot_x + plot_w, wf_y + wf_tex_rows * row_h);
+        D2D1_RECT_F src = D2D1::RectF(0.0f, 0.0f, static_cast<float>(width), static_cast<float>(wf_tex_rows));
+#ifdef _WIN32
+        if (wf_bitmap) {
+            rt->DrawBitmap(wf_bitmap, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+        }
+#elif defined(__APPLE__)
+        if (wf_mac_bmp) {
+            rt->DrawBitmap(wf_mac_bmp, dst, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_LINEAR, &src);
+        }
+#endif
     }
 
     void draw_text(const std::string& utf8,
@@ -4181,17 +4444,82 @@ public:
                    const D2D1_RECT_F& r,
                    D2D1_COLOR_F color,
                    DWRITE_TEXT_ALIGNMENT align = DWRITE_TEXT_ALIGNMENT_LEADING) {
-        if (!fmt || utf8.empty()) return;
+        if (!rt || !fmt || utf8.empty()) return;
+        if (r.right <= r.left || r.bottom <= r.top) return;
+        ID2D1SolidColorBrush* b = brush(color);
+        if (!b) return;
+#ifdef _WIN32
+        int w_half = std::max(1, static_cast<int>(std::round((r.right - r.left) * 2.0f)));
+        int h_half = std::max(1, static_cast<int>(std::round((r.bottom - r.top) * 2.0f)));
+        if (dwrite_factory && utf8.size() <= 320) {
+            uint64_t h = 14695981039346656037ULL;
+            auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+            mix(reinterpret_cast<uintptr_t>(fmt));
+            mix(static_cast<uint64_t>(align));
+            mix((static_cast<uint64_t>(static_cast<uint32_t>(w_half)) << 32) | static_cast<uint32_t>(h_half));
+            for (unsigned char ch : utf8) { h ^= ch; h *= 1099511628211ULL; }
+
+            IDWriteTextLayout* layout = nullptr;
+            auto it = text_layout_cache.find(h);
+            if (it != text_layout_cache.end() &&
+                it->second.fmt == fmt &&
+                it->second.align == align &&
+                it->second.w_half_px == w_half &&
+                it->second.h_half_px == h_half &&
+                it->second.text == utf8 &&
+                it->second.layout) {
+                it->second.last_frame = frame_no;
+                layout = it->second.layout;
+            } else {
+                fmt->SetTextAlignment(align);
+                fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+                wchar_t stack_w[512];
+                int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), stack_w, 511);
+                if (wlen > 0) {
+                    dwrite_factory->CreateTextLayout(stack_w, static_cast<UINT32>(wlen), fmt,
+                                                     w_half * 0.5f, h_half * 0.5f, &layout);
+                } else {
+                    std::wstring w = to_wide(utf8);
+                    dwrite_factory->CreateTextLayout(w.c_str(), static_cast<UINT32>(w.size()), fmt,
+                                                     w_half * 0.5f, h_half * 0.5f, &layout);
+                }
+                if (layout) {
+                    if (it != text_layout_cache.end() && it->second.layout) {
+                        it->second.layout->Release();
+                    }
+                    text_layout_cache[h] = {fmt, align, w_half, h_half, utf8, layout, frame_no};
+                    if (text_layout_cache.size() > 2400) {
+                        for (auto e = text_layout_cache.begin(); e != text_layout_cache.end();) {
+                            if (e->second.last_frame + 120 < frame_no && e->second.layout != layout) {
+                                if (e->second.layout) e->second.layout->Release();
+                                e = text_layout_cache.erase(e);
+                            } else {
+                                ++e;
+                            }
+                        }
+                    }
+                }
+            }
+            if (layout) {
+                rt->DrawTextLayout(D2D1::Point2F(r.left, r.top), layout, b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+                return;
+            }
+        }
         fmt->SetTextAlignment(align);
         fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
-        ID2D1SolidColorBrush* b = nullptr;
-        rt->CreateSolidColorBrush(color, &b);
-        if (b) {
+        wchar_t stack_w[512];
+        int wlen = MultiByteToWideChar(CP_UTF8, 0, utf8.data(), static_cast<int>(utf8.size()), stack_w, 511);
+        if (wlen > 0) {
+            rt->DrawText(stack_w, static_cast<UINT32>(wlen), fmt, r, b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
+        } else {
             std::wstring w = to_wide(utf8);
-            rt->DrawText(w.c_str(), static_cast<UINT32>(w.size()), fmt, r, b,
-                         D2D1_DRAW_TEXT_OPTIONS_CLIP);
-            b->Release();
+            rt->DrawText(w.c_str(), static_cast<UINT32>(w.size()), fmt, r, b, D2D1_DRAW_TEXT_OPTIONS_CLIP);
         }
+#elif defined(__APPLE__)
+        fmt->SetTextAlignment(align);
+        fmt->SetParagraphAlignment(DWRITE_PARAGRAPH_ALIGNMENT_CENTER);
+        rt->DrawUtf8Text(utf8, fmt, r, b);
+#endif
     }
 
     // Unpacks a 180-byte 1-bit bitmap into a stack-allocated 1,440-pixel (48x30) buffer and renders it
@@ -4215,17 +4543,20 @@ public:
 
         bool drawn = false;
 #ifdef _WIN32
-        // Stack-allocated 48x30 BGRA texture (5,760 bytes on stack)
+        // Stack-allocated 48x30 BGRA texture (5,760 bytes on stack) uploaded into persistent GPU bitmap
         uint32_t bgra[MONO_IMG_PIXELS];
         for (size_t i = 0; i < MONO_IMG_PIXELS; ++i) {
             bgra[i] = pixels[i] ? 0xFFF8FAFCu : 0xFF05080Fu;
         }
-        ID2D1Bitmap* bmp = nullptr;
-        D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
-            D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
-        if (SUCCEEDED(rt->CreateBitmap(D2D1::SizeU(MONO_IMG_W, MONO_IMG_H), bgra, MONO_IMG_W * 4, &props, &bmp)) && bmp) {
-            rt->DrawBitmap(bmp, canvas_r, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src_r);
-            bmp->Release();
+        if (!mono_bitmap) {
+            D2D1_BITMAP_PROPERTIES props = D2D1::BitmapProperties(
+                D2D1::PixelFormat(DXGI_FORMAT_B8G8R8A8_UNORM, D2D1_ALPHA_MODE_IGNORE), 96.0f, 96.0f);
+            rt->CreateBitmap(D2D1::SizeU(MONO_IMG_W, MONO_IMG_H), nullptr, 0, &props, &mono_bitmap);
+        }
+        if (mono_bitmap) {
+            D2D1_RECT_U dst_u = D2D1::RectU(0, 0, MONO_IMG_W, MONO_IMG_H);
+            mono_bitmap->CopyFromMemory(&dst_u, bgra, MONO_IMG_W * 4);
+            rt->DrawBitmap(mono_bitmap, canvas_r, 1.0f, D2D1_BITMAP_INTERPOLATION_MODE_NEAREST_NEIGHBOR, &src_r);
             drawn = true;
         }
 #elif defined(__APPLE__)
@@ -4261,29 +4592,22 @@ public:
         }
 #endif
         if (!drawn) {
-            // Exact integer-aligned Nearest-Neighbor block fallback
-            ID2D1SolidColorBrush* bg_b = nullptr;
-            ID2D1SolidColorBrush* fg_b = nullptr;
-            rt->CreateSolidColorBrush(D2D1::ColorF(0.02f, 0.03f, 0.06f, 1.0f), &bg_b);
-            rt->CreateSolidColorBrush(D2D1::ColorF(0.97f, 0.98f, 0.99f, 1.0f), &fg_b);
-            if (bg_b && fg_b) {
-                rt->FillRectangle(canvas_r, bg_b);
-                for (size_t py = 0; py < MONO_IMG_H; ++py) {
-                    float ry0 = y + static_cast<float>(py) * pixel_scale;
-                    float ry1 = ry0 + pixel_scale;
-                    size_t px = 0;
-                    while (px < MONO_IMG_W) {
-                        if (!pixels[py * MONO_IMG_W + px]) { ++px; continue; }
-                        size_t run_end = px + 1;
-                        while (run_end < MONO_IMG_W && pixels[py * MONO_IMG_W + run_end]) ++run_end;
-                        rt->FillRectangle(D2D1::RectF(x + static_cast<float>(px) * pixel_scale, ry0,
-                                                      x + static_cast<float>(run_end) * pixel_scale, ry1), fg_b);
-                        px = run_end;
-                    }
+            // Exact integer-aligned Nearest-Neighbor block fallback using zero-allocation shared_brush
+            fill_rect(canvas_r, D2D1::ColorF(0.02f, 0.03f, 0.06f, 1.0f));
+            D2D1_COLOR_F fg_col = D2D1::ColorF(0.97f, 0.98f, 0.99f, 1.0f);
+            for (size_t py = 0; py < MONO_IMG_H; ++py) {
+                float ry0 = y + static_cast<float>(py) * pixel_scale;
+                float ry1 = ry0 + pixel_scale;
+                size_t px = 0;
+                while (px < MONO_IMG_W) {
+                    if (!pixels[py * MONO_IMG_W + px]) { ++px; continue; }
+                    size_t run_end = px + 1;
+                    while (run_end < MONO_IMG_W && pixels[py * MONO_IMG_W + run_end]) ++run_end;
+                    fill_rect(D2D1::RectF(x + static_cast<float>(px) * pixel_scale, ry0,
+                                          x + static_cast<float>(run_end) * pixel_scale, ry1), fg_col);
+                    px = run_end;
                 }
             }
-            if (bg_b) bg_b->Release();
-            if (fg_b) fg_b->Release();
         }
     }
 
@@ -4317,9 +4641,7 @@ public:
         return hex_color(PALETTE[sum % 8]);
     }
 
-    void render(HWND hwnd, HDC target_hdc, MeshGuiApp& app) {
-        ensure_target();
-        if (!rt || !target_hdc) return;
+    void render(HWND hwnd, HDC target_hdc, MeshGuiApp& app, bool allow_hwnd_swapchain = false) {
         light_mode = app.light_mode;
 
         RECT rc;
@@ -4328,23 +4650,59 @@ public:
         int h_px = rc.bottom - rc.top;
         if (w_px <= 0 || h_px <= 0) return;
 
-        HDC mem_dc = CreateCompatibleDC(target_hdc);
 #ifdef _WIN32
-        BITMAPINFO dib_bmi{};
-        dib_bmi.bmiHeader.biSize        = sizeof(BITMAPINFOHEADER);
-        dib_bmi.bmiHeader.biWidth       = w_px;
-        dib_bmi.bmiHeader.biHeight      = -h_px;
-        dib_bmi.bmiHeader.biPlanes      = 1;
-        dib_bmi.bmiHeader.biBitCount    = 32;
-        dib_bmi.bmiHeader.biCompression = BI_RGB;
-        void* dib_bits = nullptr;
-        HBITMAP mem_bmp = CreateDIBSection(mem_dc, &dib_bmi, DIB_RGB_COLORS, &dib_bits, nullptr, 0);
-#else
-        HBITMAP mem_bmp = CreateCompatibleBitmap(target_hdc, w_px, h_px);
+        const bool streaming_active = hamshack::get_twitch_streamer().is_streaming.load(std::memory_order_relaxed);
+        bool use_swapchain = allow_hwnd_swapchain && !streaming_active && hwnd != nullptr;
+        if (use_swapchain) {
+            ensure_hwnd_target(hwnd, w_px, h_px);
+            if (hwnd_rt) {
+                bind_resource_owner(hwnd_rt);
+            } else {
+                use_swapchain = false;
+            }
+        }
+        if (!use_swapchain) {
+            if (!target_hdc) return;
+            ensure_dc_target();
+            if (!dc_rt || !ensure_cached_dib(target_hdc, w_px, h_px)) return;
+            dc_rt->BindDC(cached_mem_dc, &rc);
+            bind_resource_owner(dc_rt);
+        }
+#elif defined(__APPLE__)
+        (void)allow_hwnd_swapchain;
+        if (!target_hdc) return;
+        ensure_dc_target();
+        if (!dc_rt) return;
+        dc_rt->BindDC(target_hdc, &rc);
+        bind_resource_owner(dc_rt);
 #endif
-        HGDIOBJ old_bmp = SelectObject(mem_dc, mem_bmp);
+        if (!rt) return;
 
-        rt->BindDC(mem_dc, &rc);
+        auto finish_frame = [&]() {
+            HRESULT hr = rt->EndDraw();
+            if (hr == D2DERR_RECREATE_TARGET) {
+                release_device_resources();
+#ifdef _WIN32
+                if (rt == hwnd_rt && hwnd_rt) {
+                    hwnd_rt->Release();
+                    hwnd_rt = nullptr;
+                } else if (rt == dc_rt && dc_rt) {
+                    dc_rt->Release();
+                    dc_rt = nullptr;
+                }
+#endif
+                rt = nullptr;
+                return;
+            }
+#ifdef _WIN32
+            if (!use_swapchain) {
+                capture_win32_frame_for_twitch(cached_mem_dc, cached_dib_bmp, w_px, h_px);
+                if (target_hdc) {
+                    BitBlt(target_hdc, 0, 0, w_px, h_px, cached_mem_dc, 0, 0, SRCCOPY);
+                }
+            }
+#endif
+        };
 
         app.tab_hits.clear();
         app.tab_close_hits.clear();
@@ -4372,9 +4730,6 @@ public:
         rt->BeginDraw();
         rt->Clear(hex_color(0x090D16));
 
-        ID2D1SolidColorBrush* line_brush = nullptr;
-        rt->CreateSolidColorBrush(hex_color(0x1E293B), &line_brush);
-
 #ifdef MESHCORE_IOS
         constexpr bool force_mobile = true;
         const float safe_top = 48.0f;
@@ -4388,10 +4743,8 @@ public:
 
         if (is_mobile) {
             float top_h = safe_top + 46.0f;
-            fill_round_rect(D2D1::RectF(0, 0, W, top_h), 0.0f, hex_color(0x0F172A));
-            if (line_brush) {
-                rt->DrawLine(D2D1::Point2F(0, top_h), D2D1::Point2F(W, top_h), line_brush, 1.5f);
-            }
+            fill_rect(D2D1::RectF(0, 0, W, top_h), hex_color(0x0F172A));
+            draw_line(D2D1::Point2F(0, top_h), D2D1::Point2F(W, top_h), hex_color(0x1E293B), 1.5f);
 
             float ty = safe_top + 7.0f;
             float th = 32.0f;
@@ -4419,10 +4772,8 @@ public:
 
             float nav_h = 46.0f;
             float nav_y = H - safe_bot - nav_h;
-            fill_round_rect(D2D1::RectF(0, nav_y, W, H), 0.0f, hex_color(0x0F172A));
-            if (line_brush) {
-                rt->DrawLine(D2D1::Point2F(0, nav_y), D2D1::Point2F(W, nav_y), line_brush, 1.5f);
-            }
+            fill_rect(D2D1::RectF(0, nav_y, W, H), hex_color(0x0F172A));
+            draw_line(D2D1::Point2F(0, nav_y), D2D1::Point2F(W, nav_y), hex_color(0x1E293B), 1.5f);
 
             struct MobNavItem { int id; int tab; const char* label; uint32_t color; };
             static const MobNavItem NAV_ITEMS[5] = {
@@ -4475,17 +4826,7 @@ public:
                 render_ble_dropdown(app, 12.0f, top_h + 4.0f);
             }
 
-            if (line_brush) line_brush->Release();
-            HRESULT hr = rt->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) {
-                release_tiles();
-                rt->Release();
-                rt = nullptr;
-            }
-            BitBlt(target_hdc, 0, 0, w_px, h_px, mem_dc, 0, 0, SRCCOPY);
-            SelectObject(mem_dc, old_bmp);
-            DeleteObject(mem_bmp);
-            DeleteDC(mem_dc);
+            finish_frame();
             return;
         }
 
@@ -4541,20 +4882,7 @@ public:
             if (g_hs && g_hs->log_qso_dialog.is_open) {
                 hamshack_ui::render_log_qso_modal(*this, *g_hs, app.mouse_pt, W, H);
             }
-            if (line_brush) line_brush->Release();
-            HRESULT hr = rt->EndDraw();
-            if (hr == D2DERR_RECREATE_TARGET) {
-                release_tiles();
-                rt->Release();
-                rt = nullptr;
-            }
-#ifdef _WIN32
-            capture_win32_frame_for_twitch(mem_dc, mem_bmp, w_px, h_px);
-#endif
-            BitBlt(target_hdc, 0, 0, w_px, h_px, mem_dc, 0, 0, SRCCOPY);
-            SelectObject(mem_dc, old_bmp);
-            DeleteObject(mem_bmp);
-            DeleteDC(mem_dc);
+            finish_frame();
             return;
         }
 
@@ -4695,20 +5023,7 @@ public:
                 hamshack_ui::render_log_qso_modal(*this, *g_hs, app.mouse_pt, W, H);
             }
         }
-        if (line_brush) line_brush->Release();
-        HRESULT hr = rt->EndDraw();
-        if (hr == D2DERR_RECREATE_TARGET) {
-            release_tiles();
-            rt->Release();
-            rt = nullptr;
-        }
-#ifdef _WIN32
-        capture_win32_frame_for_twitch(mem_dc, mem_bmp, w_px, h_px);
-#endif
-        BitBlt(target_hdc, 0, 0, w_px, h_px, mem_dc, 0, 0, SRCCOPY);
-        SelectObject(mem_dc, old_bmp);
-        DeleteObject(mem_bmp);
-        DeleteDC(mem_dc);
+        finish_frame();
     }
 
 private:
@@ -6032,8 +6347,7 @@ private:
 
         const bool light = app.map_style == 1;
         rt->PushAxisAlignedClip(mr, D2D1_ANTIALIAS_MODE_ALIASED);
-        ID2D1SolidColorBrush* br = nullptr;
-        rt->CreateSolidColorBrush(hex_color(light ? 0xE5E7EB : 0x0B1220), &br);
+        ID2D1SolidColorBrush* br = brush(hex_color(light ? 0xE5E7EB : 0x0B1220));
         if (!br) {
             rt->PopAxisAlignedClip();
             return;
@@ -6370,7 +6684,6 @@ private:
                       font_ui, er, hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
         }
 
-        br->Release();
         rt->PopAxisAlignedClip();
     }
 
@@ -7174,7 +7487,53 @@ static void handle_left_double_click(HWND, POINT pt) {
     }
 }
 
+static ULONGLONG g_last_input_tick = 0;
+static ULONGLONG g_last_paint_tick = 0;
+static uint64_t g_last_hover_sig = 0;
+static uint64_t g_last_wf_seq_seen = 0;
+
+static uint64_t compute_hover_signature(POINT pt) {
+    uint64_t sig = 14695981039346656037ULL;
+    auto mix = [&](uint64_t v) { sig ^= v; sig *= 1099511628211ULL; };
+    if (g_hs) {
+        for (size_t i = 0; i < g_hs->hits.size(); ++i) {
+            if (D2DRenderer::pt_in_rect(pt, g_hs->hits[i].rect)) {
+                mix(0x100000ULL + i);
+                mix(static_cast<uint64_t>(g_hs->hits[i].id));
+                mix(static_cast<uint64_t>(g_hs->hits[i].index));
+            }
+        }
+    }
+    if (g_app) {
+        auto scan_vec = [&](const auto& vec, uint64_t tag) {
+            for (size_t i = 0; i < vec.size(); ++i) {
+                if (D2DRenderer::pt_in_rect(pt, vec[i].rect)) {
+                    mix(tag + i);
+                }
+            }
+        };
+        scan_vec(g_app->button_hits, 0x200000ULL);
+        scan_vec(g_app->tab_hits, 0x300000ULL);
+        scan_vec(g_app->tab_close_hits, 0x400000ULL);
+        scan_vec(g_app->joined_hits, 0x500000ULL);
+        scan_vec(g_app->discovered_hits, 0x600000ULL);
+        scan_vec(g_app->station_hits, 0x700000ULL);
+        scan_vec(g_app->slot_hits, 0x800000ULL);
+        scan_vec(g_app->vert_splitter_hits, 0x900000ULL);
+        scan_vec(g_app->horiz_splitter_hits, 0xA00000ULL);
+        scan_vec(g_app->module_header_hits, 0xB00000ULL);
+        scan_vec(g_app->map_pin_hits, 0xC00000ULL);
+        scan_vec(g_app->nicklist_hits, 0xD00000ULL);
+        scan_vec(g_app->packet_row_hits, 0xE00000ULL);
+    }
+    return sig;
+}
+
 static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam) {
+    if (msg == WM_LBUTTONDOWN || msg == WM_LBUTTONUP || msg == WM_RBUTTONDOWN ||
+        msg == WM_LBUTTONDBLCLK || msg == WM_MOUSEWHEEL || msg == WM_KEYDOWN || msg == WM_CHAR) {
+        g_last_input_tick = GetTickCount64();
+    }
     switch (msg) {
         case WM_SIZE:
             if (g_renderer) {
@@ -7248,7 +7607,30 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             if (g_app) {
                 g_app->tick();
                 if (g_hs) g_hs->tick();
-                InvalidateRect(hwnd, nullptr, FALSE);
+#ifdef _WIN32
+                if (IsIconic(hwnd) && !(g_hs && g_hs->twitch.is_streaming.load(std::memory_order_relaxed))) {
+                    return 0;
+                }
+#endif
+                ULONGLONG now_ms = GetTickCount64();
+                bool recent_input = (now_ms - g_last_input_tick) < 500;
+                uint64_t cur_wf_seq = g_hs ? g_hs->soundcard.waterfall_seq.load(std::memory_order_relaxed) : 0;
+                bool wf_advanced = (cur_wf_seq != g_last_wf_seq_seen);
+                g_last_wf_seq_seen = cur_wf_seq;
+
+                bool needs_60fps = recent_input || wf_advanced || g_app->is_sim ||
+                    (g_hs && (g_hs->twitch.is_streaming.load(std::memory_order_relaxed) ||
+                              g_hs->ft8.transmitting_now ||
+                              g_hs->ft8.decode_in_progress.load(std::memory_order_relaxed) ||
+                              g_hs->js8.decode_in_progress.load(std::memory_order_relaxed)));
+
+                int active_tab = g_hs ? g_hs->active_mode_tab : 3;
+                ULONGLONG min_interval_ms = needs_60fps ? 0ULL
+                                          : (active_tab == 0 || active_tab == 1 || active_tab == 2) ? 33ULL // 30 Hz slot progress when audio idle
+                                          : 100ULL; // 10 Hz low-power refresh on static tabs (IRC/Winlink/Pages/Config/idle Mesh)
+                if (now_ms - g_last_paint_tick >= min_interval_ms) {
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
 
@@ -7264,6 +7646,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     float dy = static_cast<float>(g_app->mouse_pt.y - g_hs->wf_drag_start_y);
                     if (g_hs->wf_drag_invert) dy = -dy;
                     g_hs->wide_graph_height = std::clamp(g_hs->wf_drag_start_h + dy, 110.0f, 540.0f);
+                    g_last_input_tick = GetTickCount64();
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -7275,6 +7658,7 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_hs->gt_map_nx = g_hs->gt_map_drag_nx - dx / ws;
                     g_hs->gt_map_nx -= std::floor(g_hs->gt_map_nx);
                     g_hs->gt_map_ny = std::clamp(g_hs->gt_map_drag_ny - dy / ws, 0.0, 1.0);
+                    g_last_input_tick = GetTickCount64();
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
                 }
@@ -7286,6 +7670,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                         g_app->module_drag_active = true;
                     }
                 }
+
+                bool actively_dragging = g_app->module_drag_active ||
+                                         g_app->dragging_splitter != DraggingSplitter::None ||
+                                         g_app->map_dragging ||
+                                         g_app->serial_dropdown_open ||
+                                         g_app->ble_dropdown_open ||
+                                         (g_app->center_view == CenterView::Map && D2DRenderer::pt_in_rect(g_app->mouse_pt, g_app->map_rect));
 
                 if (g_app->dragging_splitter != DraggingSplitter::None) {
                     RECT cr;
@@ -7323,7 +7714,13 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     g_app->map_nx -= std::floor(g_app->map_nx);
                     g_app->map_ny = std::clamp(g_app->map_drag_ny - dy / ws, 0.0, 1.0);
                 }
-                InvalidateRect(hwnd, nullptr, FALSE);
+
+                uint64_t hover_sig = compute_hover_signature(g_app->mouse_pt);
+                if (actively_dragging || hover_sig != g_last_hover_sig) {
+                    g_last_hover_sig = hover_sig;
+                    g_last_input_tick = GetTickCount64();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                }
             }
             return 0;
 
@@ -7669,8 +8066,9 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
         case WM_PAINT: {
             PAINTSTRUCT ps;
             BeginPaint(hwnd, &ps);
+            g_last_paint_tick = GetTickCount64();
             if (g_renderer && g_app) {
-                g_renderer->render(hwnd, ps.hdc, *g_app);
+                g_renderer->render(hwnd, ps.hdc, *g_app, true);
             }
             EndPaint(hwnd, &ps);
             return 0;

@@ -156,6 +156,7 @@ id UIImagePNGRepresentation(id image);
 #include <cstring>
 #include <ctime>
 #include <string>
+#include <unordered_map>
 #include <vector>
 
 #ifndef _stricmp
@@ -628,6 +629,12 @@ public:
         CGContextSetRGBFillColor(ctx, b->color.r, b->color.g, b->color.b, b->color.a);
         CGContextFillRect(ctx, to_cgrect(r));
     }
+    void DrawRectangle(const D2D1_RECT_F& r, ID2D1SolidColorBrush* b, float stroke = 1.0f) {
+        if (!ctx || !b) return;
+        CGContextSetRGBStrokeColor(ctx, b->color.r, b->color.g, b->color.b, b->color.a);
+        CGContextSetLineWidth(ctx, stroke);
+        CGContextStrokeRect(ctx, to_cgrect(r));
+    }
     void FillRoundedRectangle(const D2D1_ROUNDED_RECT& rr, ID2D1SolidColorBrush* b) {
         if (!ctx || !b) return;
         CGRect cgr = to_cgrect(rr.rect);
@@ -725,76 +732,134 @@ public:
             if (release_sub) CGImageRelease(img);
         }
     }
-    void DrawText(const wchar_t* wstr, UINT32 len, IDWriteTextFormat* fmt, const D2D1_RECT_F& r,
-                  ID2D1SolidColorBrush* b, D2D1_DRAW_TEXT_OPTIONS = D2D1_DRAW_TEXT_OPTIONS_CLIP) {
-        if (!ctx || !wstr || len == 0 || !fmt || !fmt->font || !b) return;
+    struct CachedCTLine {
+        CTFontRef font = nullptr;
+        uint32_t rgba = 0;
+        std::string text;
+        CTLineRef line = nullptr;
+        double width = 0.0;
+        CGFloat ascent = 0.0;
+        CGFloat descent = 0.0;
+        uint64_t last_tick = 0;
+    };
+    std::unordered_map<uint64_t, CachedCTLine> ct_line_cache;
+    uint64_t ct_access_tick = 0;
+
+    ~ID2D1DCRenderTarget() {
+        for (auto& kv : ct_line_cache) {
+            if (kv.second.line) CFRelease(kv.second.line);
+        }
+        ct_line_cache.clear();
+    }
+
+    void DrawUtf8Text(const std::string& utf8, IDWriteTextFormat* fmt, const D2D1_RECT_F& r, ID2D1SolidColorBrush* b) {
+        if (!ctx || utf8.empty() || !fmt || !fmt->font || !b) return;
         if (r.right <= r.left || r.bottom <= r.top) return;
-        std::string utf8 = mac_wide_to_utf8(std::wstring(wstr, len));
-        if (utf8.empty()) return;
 
-        CFStringRef cf_str = CFStringCreateWithBytes(nullptr, reinterpret_cast<const UInt8*>(utf8.data()),
-                                                     static_cast<CFIndex>(utf8.size()), kCFStringEncodingUTF8, false);
-        if (!cf_str) {
-            std::string clean;
-            clean.reserve(utf8.size());
-            for (unsigned char c : utf8) clean.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?');
-            cf_str = CFStringCreateWithBytes(nullptr, reinterpret_cast<const UInt8*>(clean.data()),
-                                             static_cast<CFIndex>(clean.size()), kCFStringEncodingUTF8, false);
-            if (!cf_str) return;
-        }
+        uint32_t cr = static_cast<uint32_t>(std::clamp(b->color.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+        uint32_t cg = static_cast<uint32_t>(std::clamp(b->color.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+        uint32_t cb = static_cast<uint32_t>(std::clamp(b->color.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+        uint32_t ca = static_cast<uint32_t>(std::clamp(b->color.a, 0.0f, 1.0f) * 255.0f + 0.5f);
+        uint32_t rgba_key = (cr << 24) | (cg << 16) | (cb << 8) | ca;
 
-        CGColorSpaceRef cs = CGColorSpaceCreateDeviceRGB();
-        if (!cs) {
-            CFRelease(cf_str);
-            return;
-        }
-        CGFloat comps[4] = {b->color.r, b->color.g, b->color.b, b->color.a};
-        CGColorRef cg_col = CGColorCreate(cs, comps);
-        CGColorSpaceRelease(cs);
-        if (!cg_col) {
-            CFRelease(cf_str);
-            return;
-        }
+        uint64_t h = 14695981039346656037ULL;
+        auto mix = [&](uint64_t v) { h ^= v; h *= 1099511628211ULL; };
+        mix(reinterpret_cast<uintptr_t>(fmt->font));
+        mix(rgba_key);
+        for (unsigned char ch : utf8) { h ^= ch; h *= 1099511628211ULL; }
 
-        const void* keys[2] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
-        const void* vals[2] = {fmt->font, cg_col};
-        CFDictionaryRef attrs = CFDictionaryCreate(nullptr, keys, vals, 2,
-                                                   &kCFTypeDictionaryKeyCallBacks,
-                                                   &kCFTypeDictionaryValueCallBacks);
-        if (!attrs) {
+        ++ct_access_tick;
+        CTLineRef line_to_draw = nullptr;
+        double width = 0.0;
+        CGFloat ascent = 0.0, descent = 0.0;
+
+        auto it = ct_line_cache.find(h);
+        if (it != ct_line_cache.end() && it->second.font == fmt->font &&
+            it->second.rgba == rgba_key && it->second.text == utf8 && it->second.line) {
+            it->second.last_tick = ct_access_tick;
+            line_to_draw = it->second.line;
+            width = it->second.width;
+            ascent = it->second.ascent;
+            descent = it->second.descent;
+        } else {
+            CFStringRef cf_str = CFStringCreateWithBytes(nullptr, reinterpret_cast<const UInt8*>(utf8.data()),
+                                                         static_cast<CFIndex>(utf8.size()), kCFStringEncodingUTF8, false);
+            if (!cf_str) {
+                std::string clean;
+                clean.reserve(utf8.size());
+                for (unsigned char c : utf8) clean.push_back((c >= 0x20 && c < 0x7F) ? static_cast<char>(c) : '?');
+                cf_str = CFStringCreateWithBytes(nullptr, reinterpret_cast<const UInt8*>(clean.data()),
+                                                 static_cast<CFIndex>(clean.size()), kCFStringEncodingUTF8, false);
+                if (!cf_str) return;
+            }
+            static CGColorSpaceRef s_rgb_cs = CGColorSpaceCreateDeviceRGB();
+            if (!s_rgb_cs) { CFRelease(cf_str); return; }
+            CGFloat comps[4] = {b->color.r, b->color.g, b->color.b, b->color.a};
+            CGColorRef cg_col = CGColorCreate(s_rgb_cs, comps);
+            if (!cg_col) { CFRelease(cf_str); return; }
+
+            const void* keys[2] = {kCTFontAttributeName, kCTForegroundColorAttributeName};
+            const void* vals[2] = {fmt->font, cg_col};
+            CFDictionaryRef attrs = CFDictionaryCreate(nullptr, keys, vals, 2,
+                                                       &kCFTypeDictionaryKeyCallBacks,
+                                                       &kCFTypeDictionaryValueCallBacks);
+            if (attrs) {
+                CFAttributedStringRef astr = CFAttributedStringCreate(nullptr, cf_str, attrs);
+                if (astr) {
+                    line_to_draw = CTLineCreateWithAttributedString(astr);
+                    CFRelease(astr);
+                }
+                CFRelease(attrs);
+            }
             CGColorRelease(cg_col);
             CFRelease(cf_str);
-            return;
-        }
-        CFAttributedStringRef astr = CFAttributedStringCreate(nullptr, cf_str, attrs);
-        CTLineRef line = astr ? CTLineCreateWithAttributedString(astr) : nullptr;
-        if (line) {
-            CGFloat ascent = 0, descent = 0, leading = 0;
-            double width = CTLineGetTypographicBounds(line, &ascent, &descent, &leading);
+            if (!line_to_draw) return;
 
-            CGFloat x = r.left;
-            if (fmt->text_align == DWRITE_TEXT_ALIGNMENT_CENTER) {
-                x = r.left + ((r.right - r.left) - static_cast<CGFloat>(width)) * 0.5;
-            } else if (fmt->text_align == DWRITE_TEXT_ALIGNMENT_TRAILING) {
-                x = r.right - static_cast<CGFloat>(width);
+            CGFloat leading = 0.0;
+            width = CTLineGetTypographicBounds(line_to_draw, &ascent, &descent, &leading);
+
+            if (it != ct_line_cache.end() && it->second.line) {
+                CFRelease(it->second.line);
             }
-            CGFloat baseline_y = (r.top + r.bottom) * 0.5 + (ascent - descent) * 0.5;
+            ct_line_cache[h] = {fmt->font, rgba_key, utf8, line_to_draw, width, ascent, descent, ct_access_tick};
 
-            CGContextSaveGState(ctx);
-            CGContextClipToRect(ctx, to_cgrect(r));
-            CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1.0, -1.0));
-            CGContextSetTextPosition(ctx, x, baseline_y);
-            CTLineDraw(line, ctx);
-            CGContextRestoreGState(ctx);
-            CFRelease(line);
+            if (ct_line_cache.size() > 2048) {
+                for (auto e = ct_line_cache.begin(); e != ct_line_cache.end();) {
+                    if (e->second.last_tick + 256 < ct_access_tick && e->second.line != line_to_draw) {
+                        if (e->second.line) CFRelease(e->second.line);
+                        e = ct_line_cache.erase(e);
+                    } else {
+                        ++e;
+                    }
+                }
+            }
         }
-        if (astr) CFRelease(astr);
-        CFRelease(attrs);
-        CGColorRelease(cg_col);
-        CFRelease(cf_str);
+
+        CGFloat x = r.left;
+        if (fmt->text_align == DWRITE_TEXT_ALIGNMENT_CENTER) {
+            x = r.left + ((r.right - r.left) - static_cast<CGFloat>(width)) * 0.5;
+        } else if (fmt->text_align == DWRITE_TEXT_ALIGNMENT_TRAILING) {
+            x = r.right - static_cast<CGFloat>(width);
+        }
+        CGFloat baseline_y = (r.top + r.bottom) * 0.5 + (ascent - descent) * 0.5;
+
+        CGContextSaveGState(ctx);
+        CGContextClipToRect(ctx, to_cgrect(r));
+        CGContextSetTextMatrix(ctx, CGAffineTransformMakeScale(1.0, -1.0));
+        CGContextSetTextPosition(ctx, x, baseline_y);
+        CTLineDraw(line_to_draw, ctx);
+        CGContextRestoreGState(ctx);
+    }
+
+    void DrawText(const wchar_t* wstr, UINT32 len, IDWriteTextFormat* fmt, const D2D1_RECT_F& r,
+                  ID2D1SolidColorBrush* b, D2D1_DRAW_TEXT_OPTIONS = D2D1_DRAW_TEXT_OPTIONS_CLIP) {
+        if (!wstr || len == 0) return;
+        DrawUtf8Text(mac_wide_to_utf8(std::wstring(wstr, len)), fmt, r, b);
     }
     void Release() { delete this; }
 };
+
+using ID2D1RenderTarget = ID2D1DCRenderTarget;
 
 class ID2D1Factory {
 public:

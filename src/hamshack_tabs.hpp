@@ -533,12 +533,16 @@ struct HamShackSuite {
             }
         }
 
-        // Feed live soundcard audio into CW Goertzel/SOM demodulator and JS8 slot decoder when radio/soundcard active
+        // Feed live soundcard audio into CW Goertzel/SOM demodulator (at true 100ms cadence) and async JS8 slot decoder
         if (soundcard.hw_stream_active && soundcard.rx_rms_db > -115.0f) {
-            auto chunk_100ms = soundcard.get_recent_rx_samples(1200);
-            cw.process_rx_audio_chunk(chunk_100ms);
-
             using namespace std::chrono;
+            uint64_t now_ms = static_cast<uint64_t>(duration_cast<milliseconds>(steady_clock::now().time_since_epoch()).count());
+            if ((active_mode_tab == 2 || cw.tx_active) && now_ms - last_cw_chunk_ms_ >= 95) {
+                last_cw_chunk_ms_ = now_ms;
+                auto chunk_100ms = soundcard.get_recent_rx_samples(1200);
+                cw.process_rx_audio_chunk(chunk_100ms);
+            }
+
             double epoch_s = duration_cast<milliseconds>(system_clock::now().time_since_epoch()).count() / 1000.0;
             double period = js8::submode_params(js8.current_submode).period_sec;
             int js8_slot = static_cast<int>(std::floor(epoch_s / period));
@@ -546,7 +550,7 @@ struct HamShackSuite {
             if (js8_slot != last_js8_slot_id && in_slot >= 0.4) {
                 last_js8_slot_id = js8_slot;
                 auto slot_pcm = soundcard.get_recent_rx_samples(static_cast<size_t>(period * 12000));
-                js8.decode_live_audio_slot(slot_pcm);
+                js8.decode_live_audio_slot_async(std::move(slot_pcm));
             }
         }
 
@@ -561,6 +565,9 @@ struct HamShackSuite {
             }
         }
     }
+
+private:
+    uint64_t last_cw_chunk_ms_ = 0;
 };
 
 // Map waterfall intensity (0..255) to 5 selectable high-contrast color palettes (Requirement 5)
@@ -1089,60 +1096,97 @@ inline void render_waterfall_widget(RendererT& r, HamShackSuite& hs, POINT mouse
                           mid ? r.hex_color(0x38BDF8, 0.26f) : r.hex_color(0x334155, 0.18f));
     }
 
-    std::array<float, hamshack::SoundcardEngine::WF_BINS> spec{};
-    static thread_local std::vector<hamshack::SoundcardEngine::WaterfallRow> s_wf_rows;
-    s_wf_rows.clear();
+    constexpr int BINS = hamshack::SoundcardEngine::WF_BINS;
+    std::array<float, BINS> spec{};
     bool has_audio = false;
+    uint64_t cur_wf_seq = hs.soundcard.waterfall_seq.load(std::memory_order_acquire);
+
+    // Precompute 256-entry heat palette table for both spectrum bars and streaming waterfall texture
+    D2D1_COLOR_F heat_lut_f[256];
+    heat_lut_f[0] = D2D1::ColorF(0.0f, 0.0f, 0.0f, 0.0f);
+    for (int iv = 1; iv < 256; ++iv) {
+        heat_lut_f[iv] = waterfall_heat_color(static_cast<uint8_t>(iv), r.light_mode, cur_scheme);
+    }
+
+    const bool need_wf_upload = (cur_wf_seq != 0) && !r.is_waterfall_cache_valid(cur_wf_seq, cur_scheme);
     {
         std::lock_guard<std::mutex> lk(hs.soundcard.mtx);
         spec = hs.soundcard.current_spectrum;
         has_audio = (hs.soundcard.rx_rms_db > -115.0f) && !hs.soundcard.waterfall_rows.empty();
-        // Display up to 300 waterfall rows (~105 seconds of continuous historical signal data)
-        size_t max_r = std::min<size_t>(hs.soundcard.waterfall_rows.size(), 300);
-        s_wf_rows.assign(hs.soundcard.waterfall_rows.begin(), hs.soundcard.waterfall_rows.begin() + max_r);
-    }
 
-    constexpr int BINS = hamshack::SoundcardEngine::WF_BINS;
-    float bin_w = plot_w / static_cast<float>(BINS);
+        if (need_wf_upload) {
+            const int n_rows = static_cast<int>(std::min<size_t>(hs.soundcard.waterfall_rows.size(), 300));
+            uint8_t packed_lut[256][4]{};
+            for (int iv = 1; iv < 256; ++iv) {
+                const D2D1_COLOR_F& c = heat_lut_f[iv];
+                uint8_t cr = static_cast<uint8_t>(std::clamp(c.r, 0.0f, 1.0f) * 255.0f + 0.5f);
+                uint8_t cg = static_cast<uint8_t>(std::clamp(c.g, 0.0f, 1.0f) * 255.0f + 0.5f);
+                uint8_t cb = static_cast<uint8_t>(std::clamp(c.b, 0.0f, 1.0f) * 255.0f + 0.5f);
+#ifdef _WIN32
+                packed_lut[iv][0] = cb;
+                packed_lut[iv][1] = cg;
+                packed_lut[iv][2] = cr;
+                packed_lut[iv][3] = 255;
+#else
+                packed_lut[iv][0] = cr;
+                packed_lut[iv][1] = cg;
+                packed_lut[iv][2] = cb;
+                packed_lut[iv][3] = 255;
+#endif
+            }
 
-    // Render Spectrum Bars (using high-contrast heat color corresponding to signal strength)
-    if (has_audio) {
-        for (int b = 0; b < BINS; ++b) {
-            float v = std::clamp(spec[b], 0.0f, 1.0f);
-            if (v <= 0.015f) continue; // Noise floor suppressed
-            float bh = v * (spec_h - 4.0f);
-            float bx = plot_x + b * bin_w;
-            D2D1_RECT_F bar = D2D1::RectF(bx, spec_y + spec_h - bh, bx + std::max(0.6f, bin_w), spec_y + spec_h);
-            uint8_t iv = static_cast<uint8_t>(std::clamp(v * 255.0f, 1.0f, 255.0f));
-            r.fill_round_rect(bar, 0.0f, waterfall_heat_color(iv, r.light_mode, cur_scheme));
+            const size_t req_bytes = static_cast<size_t>(std::max(1, n_rows)) * BINS * 4;
+            if (r.wf_pixel_bytes.size() < req_bytes) {
+                r.wf_pixel_bytes.resize(static_cast<size_t>(300) * BINS * 4, 0);
+            }
+            r.wf_intervals.clear();
+
+            for (int ri = 0; ri < n_rows; ++ri) {
+                const auto& src_row = hs.soundcard.waterfall_rows[ri];
+                uint8_t* dst_row = r.wf_pixel_bytes.data() + static_cast<size_t>(ri) * BINS * 4;
+                const uint8_t* bins_ptr = src_row.bins.data();
+                for (int b = 0; b < BINS; ++b) {
+                    std::memcpy(dst_row + b * 4, packed_lut[bins_ptr[b]], 4);
+                }
+                if (src_row.is_interval_start) {
+                    r.wf_intervals.push_back({ri, src_row.band_label.empty() ? hs.current_band_label() : src_row.band_label});
+                }
+            }
+            r.update_waterfall_texture(BINS, n_rows, r.wf_pixel_bytes.data(), cur_wf_seq, cur_scheme);
         }
     }
 
-    // Render Waterfall Rows (only signals above noise floor are drawn, leaving pitch black background)
-    if (!s_wf_rows.empty()) {
-        int n_rows = static_cast<int>(s_wf_rows.size());
-        float row_h = wf_h / static_cast<float>(std::max(16, n_rows));
-        for (int ri = 0; ri < n_rows; ++ri) {
-            float ry = wf_y + ri * row_h;
-            const auto& row = s_wf_rows[ri];
-
-            for (int b = 0; b < BINS; ++b) {
-                uint8_t v = row.bins[b];
-                if (v == 0) continue; // Pure noise-subtracted clean black floor
-                float bx = plot_x + b * bin_w;
-                D2D1_RECT_F cell = D2D1::RectF(bx, ry, bx + std::max(0.6f, bin_w), ry + row_h + 0.4f);
-                r.fill_round_rect(cell, 0.0f, waterfall_heat_color(v, r.light_mode, cur_scheme));
+    // Render Spectrum Bars coalesced to screen pixel columns (eliminates sub-pixel overdraw)
+    if (has_audio) {
+        const int n_cols = std::clamp(static_cast<int>(plot_w), 120, BINS);
+        const float col_w = plot_w / static_cast<float>(n_cols);
+        for (int c = 0; c < n_cols; ++c) {
+            int b0 = (c * BINS) / n_cols;
+            int b1 = std::max(b0 + 1, ((c + 1) * BINS) / n_cols);
+            float v = 0.0f;
+            for (int b = b0; b < b1; ++b) {
+                if (spec[b] > v) v = spec[b];
             }
+            v = std::clamp(v, 0.0f, 1.0f);
+            if (v <= 0.015f) continue; // Noise floor suppressed
+            float bh = v * (spec_h - 4.0f);
+            float bx = plot_x + c * col_w;
+            D2D1_RECT_F bar = D2D1::RectF(bx, spec_y + spec_h - bh, bx + std::max(1.0f, col_w), spec_y + spec_h);
+            uint8_t iv = static_cast<uint8_t>(std::clamp(v * 255.0f, 1.0f, 255.0f));
+            r.fill_rect(bar, heat_lut_f[iv]);
+        }
+    }
 
-            // Lines across at 15-second intervals with band label under the line at far left
-            if (row.is_interval_start) {
-                D2D1_RECT_F l_rect = D2D1::RectF(plot_x, ry, plot_x + plot_w, ry + 1.5f);
-                r.fill_round_rect(l_rect, 0.0f, r.hex_color(0x38BDF8, 0.85f));
-                std::string b_txt = row.band_label.empty() ? hs.current_band_label() : row.band_label;
-                D2D1_RECT_F t_rect = D2D1::RectF(plot_x + 2.0f, ry + 2.0f, plot_x + 58.0f, ry + 16.0f);
-                r.fill_round_rect(t_rect, 2.0f, r.hex_color(0x020617, 0.85f));
-                r.draw_text(b_txt, r.font_mono_small, t_rect, r.hex_color(0xFACC15), DWRITE_TEXT_ALIGNMENT_CENTER);
-            }
+    // Render Waterfall via 1 single GPU DrawBitmap call + crisp vector 15-second interval lines
+    if (r.wf_tex_rows > 0) {
+        r.draw_waterfall_texture(plot_x, wf_y, plot_w, wf_h, BINS);
+        float row_h = wf_h / static_cast<float>(std::max(16, r.wf_tex_rows));
+        for (const auto& ivm : r.wf_intervals) {
+            float ry = wf_y + ivm.row_idx * row_h;
+            r.fill_rect(D2D1::RectF(plot_x, ry, plot_x + plot_w, ry + 1.5f), r.hex_color(0x38BDF8, 0.85f));
+            D2D1_RECT_F t_rect = D2D1::RectF(plot_x + 2.0f, ry + 2.0f, plot_x + 58.0f, ry + 16.0f);
+            r.fill_round_rect(t_rect, 2.0f, r.hex_color(0x020617, 0.85f));
+            r.draw_text(ivm.band_label, r.font_mono_small, t_rect, r.hex_color(0xFACC15), DWRITE_TEXT_ALIGNMENT_CENTER);
         }
     }
 
@@ -2414,12 +2458,7 @@ inline void render_gridtracker_workspace(RendererT& r, AppT& app, HamShackSuite&
 
         // Night dark-tint overlay so maps match the dark UI
         if (!r.light_mode) {
-            ID2D1SolidColorBrush* tint_br = nullptr;
-            r.rt->CreateSolidColorBrush(r.hex_color(0x0B1220, 0.54f), &tint_br);
-            if (tint_br) {
-                r.rt->FillRectangle(map_r, tint_br);
-                tint_br->Release();
-            }
+            r.fill_rect(map_r, r.hex_color(0x0B1220, 0.54f));
         }
 
         // Solar Grayline Terminator shading
@@ -2527,17 +2566,13 @@ inline void render_gridtracker_workspace(RendererT& r, AppT& app, HamShackSuite&
                     float mid_y = (p0.y + p1.y) * 0.5f - std::min(45.0f, std::abs(p1.x - p0.x) * 0.18f);
 
                     D2D1_POINT_2F prev = p0;
+                    D2D1_COLOR_F arc_col = r.hex_color(col, alpha);
                     for (int s = 1; s <= 12; ++s) {
                         float t = s / 12.0f;
                         float cur_x = (1 - t) * (1 - t) * p0.x + 2 * (1 - t) * t * mid_x + t * t * p1.x;
                         float cur_y = (1 - t) * (1 - t) * p0.y + 2 * (1 - t) * t * mid_y + t * t * p1.y;
                         D2D1_POINT_2F curr = D2D1::Point2F(cur_x, cur_y);
-                        ID2D1SolidColorBrush* br = nullptr;
-                        r.rt->CreateSolidColorBrush(r.hex_color(col, alpha), &br);
-                        if (br) {
-                            r.rt->DrawLine(prev, curr, br, 1.6f);
-                            br->Release();
-                        }
+                        r.draw_line(prev, curr, arc_col, 1.6f);
                         prev = curr;
                     }
                 };
@@ -4338,7 +4373,7 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt) {
                 return true;
             }
             case HS_FT_DECODE_NOW:
-                hs.ft8.trigger_manual_decode(hs.soundcard);
+                hs.ft8.trigger_manual_decode_async(hs.soundcard);
                 return true;
             case HS_FT_DX_CALL_BOX:
                 hs.text_focus = HsTextFocus::Ft8DxCall;
@@ -4403,7 +4438,7 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt) {
             case HS_JS8_MESH_BRIDGE:hs.js8.bridge_to_meshcore = !hs.js8.bridge_to_meshcore; return true;
             case HS_JS8_DECODE_NOW: {
                 auto pcm = hs.soundcard.get_recent_rx_samples(180000);
-                hs.js8.decode_live_audio_slot(pcm);
+                hs.js8.decode_live_audio_slot_async(std::move(pcm));
                 return true;
             }
             case HS_JS8_CLEAR_BTN: {

@@ -19,6 +19,8 @@
 #include <iomanip>
 #include <functional>
 #include <atomic>
+#include <condition_variable>
+#include <thread>
 #include "psk_reporter.hpp"
 
 namespace js8 {
@@ -500,8 +502,24 @@ public:
     std::function<void(const std::string& from, const std::string& text)> on_mesh_bridge_forward;
 
     mutable std::mutex mtx;
+    std::atomic<bool> decode_in_progress{false};
 
     JS8ModemEngine() = default;
+
+    ~JS8ModemEngine() {
+        stop_decode_worker();
+    }
+
+    void stop_decode_worker() {
+        {
+            std::lock_guard<std::mutex> lk(decode_job_mtx_);
+            decode_worker_stop_ = true;
+        }
+        decode_job_cv_.notify_all();
+        if (decode_worker_.joinable()) {
+            decode_worker_.join();
+        }
+    }
 
     static std::string current_utc_str() {
         std::time_t now = std::time(nullptr);
@@ -648,24 +666,35 @@ public:
         }
 
         // Handle JS8Call AUTO replies to directed queries
-        if (auto_reply_enabled && to_call == my_call) {
-            char snr_str[16];
-            std::snprintf(snr_str, sizeof(snr_str), "%+03d", snr_db);
-            if (body.find("SNR?") != std::string::npos) {
-                queue_message(my_call + ": " + from_call + " SNR " + snr_str);
-            } else if (body.find("INFO?") != std::string::npos) {
-                queue_message(my_call + ": " + from_call + " INFO " + my_info);
-            } else if (body.find("GRID?") != std::string::npos) {
-                queue_message(my_call + ": " + from_call + " GRID " + my_grid);
-            } else if (body.find("STATUS?") != std::string::npos) {
-                queue_message(my_call + ": " + from_call + " STATUS " + my_status);
-            } else if (body.find("HEARING?") != std::string::npos) {
-                std::string hlist;
+        std::string my_call_snap, my_info_snap, my_grid_snap, my_status_snap, hlist;
+        bool do_auto = false;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            do_auto = auto_reply_enabled && (to_call == my_call);
+            if (do_auto) {
+                my_call_snap = my_call;
+                my_info_snap = my_info;
+                my_grid_snap = my_grid;
+                my_status_snap = my_status;
                 int cnt = 0;
                 for (const auto& h : heard_stations) {
                     if (cnt++ < 4) hlist += h.callsign + " ";
                 }
-                queue_message(my_call + ": " + from_call + " HEARING " + hlist);
+            }
+        }
+        if (do_auto) {
+            char snr_str[16];
+            std::snprintf(snr_str, sizeof(snr_str), "%+03d", snr_db);
+            if (body.find("SNR?") != std::string::npos) {
+                queue_message(my_call_snap + ": " + from_call + " SNR " + snr_str);
+            } else if (body.find("INFO?") != std::string::npos) {
+                queue_message(my_call_snap + ": " + from_call + " INFO " + my_info_snap);
+            } else if (body.find("GRID?") != std::string::npos) {
+                queue_message(my_call_snap + ": " + from_call + " GRID " + my_grid_snap);
+            } else if (body.find("STATUS?") != std::string::npos) {
+                queue_message(my_call_snap + ": " + from_call + " STATUS " + my_status_snap);
+            } else if (body.find("HEARING?") != std::string::npos) {
+                queue_message(my_call_snap + ": " + from_call + " HEARING " + hlist);
             }
         }
     }
@@ -674,53 +703,99 @@ public:
         // Removed fake simulation: only live soundcard JS8 frames are decoded
     }
 
+    // Non-blocking background slot decode (zero GUI thread stall)
+    void decode_live_audio_slot_async(std::vector<float>&& pcm_12k) {
+        {
+            std::lock_guard<std::mutex> lk(decode_job_mtx_);
+            if (decode_worker_stop_) return;
+            if (!decode_worker_started_) {
+                decode_worker_started_ = true;
+                decode_worker_ = std::thread([this]() {
+                    for (;;) {
+                        std::vector<float> job;
+                        {
+                            std::unique_lock<std::mutex> ul(decode_job_mtx_);
+                            decode_job_cv_.wait(ul, [this]() { return decode_worker_stop_ || has_pending_job_; });
+                            if (decode_worker_stop_) break;
+                            job = std::move(pending_pcm_);
+                            has_pending_job_ = false;
+                        }
+                        decode_in_progress.store(true, std::memory_order_release);
+                        decode_live_audio_slot(job);
+                        decode_in_progress.store(false, std::memory_order_release);
+                    }
+                });
+            }
+            pending_pcm_ = std::move(pcm_12k);
+            has_pending_job_ = true;
+        }
+        decode_job_cv_.notify_one();
+    }
+
     // Demodulate live 12 kHz soundcard samples for JS8 8-FSK frames using Costas sync + LDPC(174,87) + CRC-12
     void decode_live_audio_slot(const std::vector<float>& pcm_12k) {
-        const auto& sp = submode_params(current_submode);
+        Submode sm_snap;
+        {
+            std::lock_guard<std::mutex> lk(mtx);
+            sm_snap = current_submode;
+        }
+        const auto& sp = submode_params(sm_snap);
         const int nsps = sp.nsps_12k;
         const int step = nsps / 2;
-        if ((int)pcm_12k.size() < nsps * 80) return;
+        const int pcm_len = static_cast<int>(pcm_12k.size());
+        if (pcm_len < nsps * 80) return;
 
         double energy = 0.0;
         for (float s : pcm_12k) energy += (double)s * s;
         if (energy < 1e-8) return;
 
-        const int nsteps = ((int)pcm_12k.size() - nsps) / step;
+        const int nsteps = (pcm_len - nsps) / step;
         if (nsteps < 158) return;
 
-        double baud = 12000.0 / (double)nsps;
+        const double baud = 12000.0 / (double)nsps;
+        const float inv_nsps = 1.0f / (float)nsps;
         std::string utc = current_utc_str();
 
         // Scan candidate frequencies around rx_offset_hz and across the passband (400..2600 Hz)
         for (int f_base = 400; f_base <= 2600; f_base += 25) {
+            // Precompute all 8 tone Goertzel coefficients once per base frequency
+            alignas(32) double tone_coeff[8];
+            for (int m = 0; m < 8; ++m) {
+                double w = 2.0 * M_PI * (f_base + m * baud) / 12000.0;
+                tone_coeff[m] = 2.0 * std::cos(w);
+            }
+
             float best_sync = 0.0f;
             int best_t0 = 0;
+            const int max_t0_limit = std::min(nsteps, 190);
 
-            auto goertzel_mag = [&](int sample_start, double freq_hz) -> float {
-                if (sample_start < 0 || sample_start + nsps > (int)pcm_12k.size()) return 0.0f;
-                double w = 2.0 * M_PI * freq_hz / 12000.0;
-                double coeff = 2.0 * std::cos(w);
-                double s0 = 0.0, s1 = 0.0, s2 = 0.0;
-                for (int i = 0; i < nsps; ++i) {
-                    s0 = pcm_12k[sample_start + i] + coeff * s1 - s2;
-                    s2 = s1;
-                    s1 = s0;
-                }
-                double power = s1 * s1 + s2 * s2 - coeff * s1 * s2;
-                return (float)std::sqrt(std::max(0.0, power)) / (float)nsps;
-            };
-
-            for (int t0 = 0; t0 + 78 * 2 < std::min(nsteps, 190); t0 += 4) {
+            for (int t0 = 0; t0 + 78 * 2 < max_t0_limit; t0 += 4) {
                 float sig = 0.0f, bg = 1e-6f;
                 for (int k = 0; k < 7; ++k) {
                     int pos[3] = {k, 36 + k, 72 + k};
                     for (int blk = 0; blk < 3; ++blk) {
                         int s_idx = (t0 + pos[blk] * 2) * step;
+                        if (s_idx < 0 || s_idx + nsps > pcm_len) continue;
                         int expected_tone = ICOS7_MOD[blk][k];
-                        float m_sig = goertzel_mag(s_idx, f_base + expected_tone * baud);
-                        float m_alt = goertzel_mag(s_idx, f_base + ((expected_tone + 4) & 7) * baud);
-                        sig += m_sig;
-                        bg  += m_alt;
+                        int alt_tone = (expected_tone + 4) & 7;
+                        const double c_sig = tone_coeff[expected_tone];
+                        const double c_alt = tone_coeff[alt_tone];
+                        const float* p = pcm_12k.data() + s_idx;
+                        double s1_a = 0.0, s2_a = 0.0;
+                        double s1_b = 0.0, s2_b = 0.0;
+                        for (int i = 0; i < nsps; ++i) {
+                            double x = static_cast<double>(p[i]);
+                            double s0_a = x + c_sig * s1_a - s2_a;
+                            s2_a = s1_a;
+                            s1_a = s0_a;
+                            double s0_b = x + c_alt * s1_b - s2_b;
+                            s2_b = s1_b;
+                            s1_b = s0_b;
+                        }
+                        double p_sig = s1_a * s1_a + s2_a * s2_a - c_sig * s1_a * s2_a;
+                        double p_alt = s1_b * s1_b + s2_b * s2_b - c_alt * s1_b * s2_b;
+                        sig += (float)std::sqrt(std::max(0.0, p_sig)) * inv_nsps;
+                        bg  += (float)std::sqrt(std::max(0.0, p_alt)) * inv_nsps;
                     }
                 }
                 float ratio = sig / bg;
@@ -737,9 +812,22 @@ public:
                     if (j == 29) sym += 7;
                     int s_idx = (best_t0 + sym * 2) * step;
                     ++sym;
-                    float E[8];
-                    for (int m = 0; m < 8; ++m) {
-                        E[m] = goertzel_mag(s_idx, f_base + m * baud);
+                    float E[8]{};
+                    if (s_idx >= 0 && s_idx + nsps <= pcm_len) {
+                        const float* p = pcm_12k.data() + s_idx;
+                        alignas(32) double s1[8]{}, s2[8]{};
+                        for (int i = 0; i < nsps; ++i) {
+                            double x = static_cast<double>(p[i]);
+                            for (int m = 0; m < 8; ++m) {
+                                double s0 = x + tone_coeff[m] * s1[m] - s2[m];
+                                s2[m] = s1[m];
+                                s1[m] = s0;
+                            }
+                        }
+                        for (int m = 0; m < 8; ++m) {
+                            double power = s1[m] * s1[m] + s2[m] * s2[m] - tone_coeff[m] * s1[m] * s2[m];
+                            E[m] = (float)std::sqrt(std::max(0.0, power)) * inv_nsps;
+                        }
                     }
                     for (int bit = 0; bit < 3; ++bit) {
                         int mask = 1 << (2 - bit);
@@ -758,7 +846,7 @@ public:
                     int snr = std::clamp((int)std::round(20.0f * std::log10(std::max(0.1f, best_sync - 1.0f)) - 10.0f), -24, +24);
                     {
                         std::lock_guard<std::mutex> lk(mtx);
-                        JS8FrameLog fl{utc, snr, (best_t0 * (float)step) / 12000.0f, f_base, current_submode, flags, decoded_12, false};
+                        JS8FrameLog fl{utc, snr, (best_t0 * (float)step) / 12000.0f, f_base, sm_snap, flags, decoded_12, false};
                         band_frames.push_back(fl);
                         if (band_frames.size() > 200) band_frames.erase(band_frames.begin());
                     }
@@ -767,12 +855,21 @@ public:
                         std::string fc = decoded_12.substr(0, colon);
                         std::string rest = decoded_12.substr(colon + 1);
                         while (!rest.empty() && rest.front() == ' ') rest.erase(rest.begin());
-                        on_receive_complete_message(fc, "@ALLCALL", rest, snr, f_base, current_submode);
+                        on_receive_complete_message(fc, "@ALLCALL", rest, snr, f_base, sm_snap);
                     }
                 }
             }
         }
     }
+
+private:
+    std::mutex decode_job_mtx_;
+    std::condition_variable decode_job_cv_;
+    std::thread decode_worker_;
+    bool decode_worker_started_ = false;
+    bool decode_worker_stop_ = false;
+    bool has_pending_job_ = false;
+    std::vector<float> pending_pcm_;
 };
 
 } // namespace js8

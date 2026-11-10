@@ -49,8 +49,8 @@ HamShack++ integrates and attributes the core DSP modems, protocols, and workflo
 ### 2. WSJT-X — FT8 & FT4 Weak-Signal Workstation (`includes/modem_ft8_ft4.hpp`)
 ![WSJT-X FT8 / FT4 Workstation](screenshots/01-wsjtx-ft8-workstation.png)
 
-* **Full 77-Bit Protocol & `LDPC(174,91)` FEC**: Implements WSJT-X 77-bit message packing/unpacking (standard callsigns, directed `CQ DX` / `CQ POTA` / `CQ SOTA`, compound calls, grids, SNR reports, `RRR`, `RR73`, `73`), 14-bit CRC, Belief-Propagation `LDPC(174,91)` soft-decision decoding, and continuous-phase `8-GFSK` (FT8, 15.0s, 79 symbols) and `4-GFSK` (FT4, 7.5s, 105 symbols) synthesis.
-* **Doubled Wide Graph Waterfall**: 8192-point FFT (`~0.97 Hz/bin`, 2880 bins across `100`–`2900 Hz`) with draggable top/bottom splitter, 5 waterfall color palettes, and click-to-QSY RX/TX markers.
+* **Full 77-Bit Protocol & Async SIMD `LDPC(174,91)` FEC**: Implements WSJT-X 77-bit message packing/unpacking (standard callsigns, directed `CQ DX` / `CQ POTA` / `CQ SOTA`, compound calls, grids, SNR reports, `RRR`, `RR73`, `73`), 14-bit CRC, vectorized multi-lane Costas/Goertzel fine sync, background worker `LDPC(174,91)` soft-decision decoding (`0.00 ms` UI stall), and continuous-phase `8-GFSK` (FT8, 15.0s, 79 symbols) and `4-GFSK` (FT4, 7.5s, 105 symbols) synthesis.
+* **GPU-Streamed Doubled Wide Graph Waterfall**: Precomputed-twiddle 8192-point FFT (`~0.97 Hz/bin`, 2880 bins across `100`–`2900 Hz`) rendered via a streaming `2880x300` GPU bitmap texture with Direct2D `ID2D1HwndRenderTarget` swapchain presentation, cached `DirectWrite` / `CoreText` glyph layouts, draggable top/bottom splitter, 5 waterfall color palettes, and click-to-QSY RX/TX markers.
 * **Dual Activity Tables & Auto-Sequencer**: Side-by-side **Band Activity** and **RX Frequency** tables with automatic US State / DXCC Country badges, worked-callsign highlighting, double-click mid-slot opposite-period TX triggering, `Tx1`–`Tx6` sequencer, and WSJT-X `.adi` ADIF log import/export.
 
 ---
@@ -121,7 +121,7 @@ HamShack++ integrates and attributes the core DSP modems, protocols, and workflo
 ### 10. Configuration, Soundcard DSP & Twitch Broadcast Studio (`src/hamshack_config.hpp`, `src/soundcard_audio.hpp`, `src/twitch_streamer.hpp`)
 ![Configuration, FLRig CAT Matrix & Twitch Studio](screenshots/10-configuration-flrig-twitch.png)
 
-* **Cross-Platform 12 kHz Soundcard DSP Engine**: Native **CoreAudio** (macOS) and **WASAPI + WinMM** (Windows) audio engine with automatic `USB Audio CODEC` discovery, live RMS/Peak dBFS metering, and adjustable RX/TX gain.
+* **Lock-Free Cross-Platform 12 kHz Soundcard DSP Engine**: Real-time lock-free SPSC **CoreAudio** (macOS) and **WASAPI + WinMM** (Windows) capture/playback ring buffers with automatic `USB Audio CODEC` discovery, live RMS/Peak dBFS metering, adaptive frame pacing, and adjustable RX/TX gain.
 * **Twitch Live Broadcast Studio**: Streams the live HamShack++ window to Twitch (`rtmp://live.twitch.tv/app/`) via FFmpeg using direct RGBA memory-pipe capture and digital silence (`anullsrc`) so your microphone, camera, and radio soundcard remain 100% isolated.
 
 ---

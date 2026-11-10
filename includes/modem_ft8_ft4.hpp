@@ -7,8 +7,10 @@
 
 #include <algorithm>
 #include <array>
+#include <atomic>
 #include <cmath>
 #include <complex>
+#include <condition_variable>
 #include <cstdint>
 #include <cstdio>
 #include <cstring>
@@ -20,6 +22,7 @@
 #include <mutex>
 #include <sstream>
 #include <string>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -213,10 +216,27 @@ public:
     mutable std::unordered_map<uint32_t, std::string> hash12_calls;
     mutable std::unordered_map<uint32_t, std::string> hash10_calls;
 
+    std::atomic<bool> decode_in_progress{false};
+
     Ft8Ft4Engine() {
         init_ldpc_tables();
         regenerate_std_msgs();
         auto_import_wsjtx_adif();
+    }
+
+    ~Ft8Ft4Engine() {
+        stop_decode_worker();
+    }
+
+    void stop_decode_worker() {
+        {
+            std::lock_guard<std::mutex> lk(decode_job_mtx_);
+            decode_worker_stop_ = true;
+        }
+        decode_job_cv_.notify_all();
+        if (decode_worker_.joinable()) {
+            decode_worker_.join();
+        }
     }
 
     // Exact WSJT-X CRC-14 (polynomial 0x2757 over 96 bits: 77 msg bits + 3 zeros + 16 zero bits)
@@ -1307,7 +1327,7 @@ public:
             out_want_ptt = false;
         }
 
-        // Decode at the end of a receive slot:
+        // Decode at the end of a receive slot on a dedicated background worker thread (0.0 ms UI stall):
         // In WSJT-X, a DT=0.0s FT8 frame runs from t=0.50s to t=13.14s of the 15s UTC slot.
         // Pass 1 at 13.40s (FT8) / 5.60s (FT4) right after normal-DT transmissions complete;
         // Pass 2 at 14.65s (FT8) / 7.05s (FT4) to catch late-DT stations.
@@ -1316,23 +1336,34 @@ public:
         if (monitor_enabled) {
             if (last_decoded_slot_id != slot_id && in_slot >= pass1_sec) {
                 last_decoded_slot_id = slot_id;
-                run_slot_decode_locked(audio, utc_buf, slot_id);
+                enqueue_async_decode(audio.get_recent_rx_samples(12000 * 15), utc_buf, slot_id);
             } else if (last_late_decoded_slot_id != slot_id && in_slot >= pass2_sec) {
                 last_late_decoded_slot_id = slot_id;
-                run_slot_decode_locked(audio, utc_buf, slot_id);
+                enqueue_async_decode(audio.get_recent_rx_samples(12000 * 15), utc_buf, slot_id);
             }
         }
     }
 
+    // Synchronous manual decode (used by deterministic unit tests)
     void trigger_manual_decode(SoundcardEngine& audio) {
-        std::lock_guard<std::recursive_mutex> lk(mtx);
         std::time_t tt = std::time(nullptr);
         std::tm gm{};
         hs_gmtime(&tt, &gm);
         char utc_buf[16];
         std::snprintf(utc_buf, sizeof(utc_buf), "%02d%02d%02d", gm.tm_hour, gm.tm_min, (gm.tm_sec / 15) * 15);
-        static int manual_slot = 100;
-        run_slot_decode_locked(audio, utc_buf, ++manual_slot);
+        int slot_id = manual_slot_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+        decode_pcm_snapshot(audio.get_recent_rx_samples(12000 * 15), utc_buf, slot_id);
+    }
+
+    // Non-blocking manual decode (used by GUI "Decode Now" button so UI never stalls)
+    void trigger_manual_decode_async(SoundcardEngine& audio) {
+        std::time_t tt = std::time(nullptr);
+        std::tm gm{};
+        hs_gmtime(&tt, &gm);
+        char utc_buf[16];
+        std::snprintf(utc_buf, sizeof(utc_buf), "%02d%02d%02d", gm.tm_hour, gm.tm_min, (gm.tm_sec / 15) * 15);
+        int slot_id = manual_slot_counter_.fetch_add(1, std::memory_order_relaxed) + 1;
+        enqueue_async_decode(audio.get_recent_rx_samples(12000 * 15), utc_buf, slot_id);
     }
 
 private:
@@ -1340,6 +1371,53 @@ private:
     int nrw_[83]{};
     int mn_[174][3]{};
     std::string last_sent_msg_;
+
+    std::atomic<int> manual_slot_counter_{100};
+    std::mutex decode_job_mtx_;
+    std::condition_variable decode_job_cv_;
+    std::thread decode_worker_;
+    bool decode_worker_started_ = false;
+    bool decode_worker_stop_ = false;
+    bool has_pending_decode_ = false;
+    std::vector<float> pending_pcm_;
+    std::string pending_utc_;
+    int pending_slot_id_ = 0;
+
+    void enqueue_async_decode(std::vector<float>&& pcm, const char* utc_buf, int slot_id) {
+        {
+            std::lock_guard<std::mutex> lk(decode_job_mtx_);
+            if (decode_worker_stop_) return;
+            if (!decode_worker_started_) {
+                decode_worker_started_ = true;
+                decode_worker_ = std::thread([this]() { decode_worker_loop(); });
+            }
+            pending_pcm_ = std::move(pcm);
+            pending_utc_ = utc_buf ? utc_buf : "";
+            pending_slot_id_ = slot_id;
+            has_pending_decode_ = true;
+        }
+        decode_job_cv_.notify_one();
+    }
+
+    void decode_worker_loop() {
+        for (;;) {
+            std::vector<float> job_pcm;
+            std::string job_utc;
+            int job_slot = 0;
+            {
+                std::unique_lock<std::mutex> lk(decode_job_mtx_);
+                decode_job_cv_.wait(lk, [this]() { return decode_worker_stop_ || has_pending_decode_; });
+                if (decode_worker_stop_) break;
+                job_pcm = std::move(pending_pcm_);
+                job_utc = std::move(pending_utc_);
+                job_slot = pending_slot_id_;
+                has_pending_decode_ = false;
+            }
+            decode_in_progress.store(true, std::memory_order_release);
+            decode_pcm_snapshot(job_pcm, job_utc.c_str(), job_slot);
+            decode_in_progress.store(false, std::memory_order_release);
+        }
+    }
 
     void init_ldpc_tables() {
         auto hex_val = [](char c) -> int {
@@ -1683,45 +1761,66 @@ public:
         }
     }
 
-    // Runs real WSJT-X `sync8` + `ft8b` multi-pass coherent/non-coherent 8-FSK demodulation + LDPC(174,91) decoding on live 12 kHz USB audio
-    void run_slot_decode_locked(SoundcardEngine& audio, const char* utc_buf, int slot_id) {
-        // Pull the last 15 seconds (180,000 samples at 12,000 Hz) from the real soundcard ring buffer
-        constexpr size_t SLOT_SAMPLES = 12000 * 15;
-        std::vector<float> pcm = audio.get_recent_rx_samples(SLOT_SAMPLES);
+    // Runs real WSJT-X `sync8` + `ft8b` multi-pass coherent/non-coherent 8-FSK demodulation + LDPC(174,91) decoding on live 12 kHz USB audio.
+    // Executes all heavy spectrogram, SIMD Goertzel, and LDPC belief-propagation passes completely UNLOCKED, acquiring `mtx` only at commit time.
+    void decode_pcm_snapshot(const std::vector<float>& pcm, const char* utc_buf, int slot_id) {
+        constexpr int NSPS = 1920;
+        constexpr int STEP = 480;
+        constexpr int NFFT = 4096;
+        if (pcm.size() < static_cast<size_t>(NSPS + 79 * 4 * STEP)) return;
+
         double energy = 0.0;
         for (float s : pcm) energy += static_cast<double>(s) * s;
         if (energy < 1e-9) return; // Soundcard silent / radio offline -> show nothing
 
         // Stage 1: Quarter-symbol spectrogram (NSPS = 1920, STEP = 480 samples = 0.04s, NFFT = 4096 -> 2.93 Hz bins)
-        constexpr int NSPS = 1920;
-        constexpr int STEP = 480;
-        constexpr int NFFT = 4096;
         const int nsteps = static_cast<int>((pcm.size() - NSPS) / STEP);
         if (nsteps < 79 * 4) return;
 
-        std::vector<std::array<float, 1024>> spec(nsteps);
-        std::vector<std::complex<float>> fft_buf(NFFT);
-        for (int t = 0; t < nsteps; ++t) {
-            size_t base = static_cast<size_t>(t) * STEP;
-            for (int i = 0; i < NSPS; ++i) {
-                // Gentle cosine-tapered Nuttall/Hann window
-                float w = 0.5f * (1.0f - std::cos(2.0f * 3.1415926535f * i / (NSPS - 1)));
-                fft_buf[i] = std::complex<float>(pcm[base + i] * w, 0.0f);
+        struct StaticFt8Tables {
+            float hann[NSPS];
+            int grid_b0[880];
+            float grid_frac[880];
+            StaticFt8Tables() {
+                for (int i = 0; i < NSPS; ++i) {
+                    hann[i] = 0.5f * (1.0f - std::cos(2.0f * 3.1415926535f * i / (NSPS - 1)));
+                }
+                // 3.125 Hz grid from 150.0 Hz .. 2896.875 Hz (865 base freqs + 7*2 tone steps = 879 points)
+                for (int g = 0; g < 880; ++g) {
+                    float freq_hz = 150.0f + g * 3.125f;
+                    float bin_f = freq_hz * NFFT / 12000.0f;
+                    int b0 = std::clamp(static_cast<int>(std::floor(bin_f)), 1, 1021);
+                    grid_b0[g] = b0;
+                    grid_frac[g] = bin_f - b0;
+                }
             }
-            for (int i = NSPS; i < NFFT; ++i) fft_buf[i] = {0.0f, 0.0f};
-            SoundcardEngine::fft_radix2(fft_buf);
+        };
+        static const StaticFt8Tables tbl;
+
+        // Pre-interpolated 3.125 Hz half-tone grid per time step eliminates 54M dynamic floor/lerp ops during Costas search
+        std::vector<std::array<float, 880>> spec_grid(nsteps);
+        alignas(32) std::array<std::complex<float>, NFFT> fft_buf;
+        std::array<float, 1024> mag_row;
+
+        for (int t = 0; t < nsteps; ++t) {
+            const float* src = pcm.data() + static_cast<size_t>(t) * STEP;
+            for (int i = 0; i < NSPS; ++i) {
+                fft_buf[i] = std::complex<float>(src[i] * tbl.hann[i], 0.0f);
+            }
+            std::fill(fft_buf.begin() + NSPS, fft_buf.end(), std::complex<float>(0.0f, 0.0f));
+            SoundcardEngine::fft_radix2_planned<NFFT>(fft_buf.data());
             for (int b = 0; b < 1024; ++b) {
-                spec[t][b] = std::abs(fft_buf[b]);
+                float re = fft_buf[b].real();
+                float im = fft_buf[b].imag();
+                mag_row[b] = std::sqrt(re * re + im * im);
+            }
+            auto& grow = spec_grid[t];
+            for (int g = 0; g < 880; ++g) {
+                int b0 = tbl.grid_b0[g];
+                float frac = tbl.grid_frac[g];
+                grow[g] = mag_row[b0] * (1.0f - frac) + mag_row[b0 + 1] * frac;
             }
         }
-
-        auto tone_mag = [&](int t_step, float freq_hz) -> float {
-            if (t_step < 0 || t_step >= nsteps) return 0.0f;
-            float bin_f = freq_hz * NFFT / 12000.0f;
-            int b0 = std::clamp(static_cast<int>(std::floor(bin_f)), 1, 1021);
-            float frac = bin_f - b0;
-            return spec[t_step][b0] * (1.0f - frac) + spec[t_step][b0 + 1] * frac;
-        };
 
         struct Candidate {
             float sync_score;
@@ -1729,24 +1828,26 @@ public:
             int t0_step;
         };
         std::vector<Candidate> raw_cands;
+        raw_cands.reserve(256);
 
         // Scan 150 Hz .. 2850 Hz in 3.125 Hz (half-tone) steps for 3x7 Costas arrays across all quarter-symbol offsets
-        for (float f0 = 150.0f; f0 <= 2850.0f; f0 += 3.125f) {
+        for (int g0 = 0; g0 <= 864; ++g0) {
+            float f0 = 150.0f + g0 * 3.125f;
             float best_score = 0.0f;
             int best_t0 = 0;
             for (int t0 = 0; t0 + 78 * 4 < nsteps; ++t0) {
                 float sig_sum = 0.0f;
                 float bg_sum = 1e-6f;
                 for (int k = 0; k < 7; ++k) {
-                    int s_pos[3] = {k, 36 + k, 72 + k};
-                    int c_tone = kFt8Costas7[k];
+                    const int s_pos[3] = {k, 36 + k, 72 + k};
+                    const int c_off = kFt8Costas7[k] * 2;
                     for (int blk = 0; blk < 3; ++blk) {
-                        int ts = t0 + s_pos[blk] * 4;
-                        for (int m = 0; m < 8; ++m) {
-                            float m_val = tone_mag(ts, f0 + m * 6.25f);
-                            if (m == c_tone) sig_sum += m_val;
-                            else bg_sum += m_val / 7.0f;
-                        }
+                        const float* rptr = spec_grid[t0 + s_pos[blk] * 4].data() + g0;
+                        float sum8 = rptr[0] + rptr[2] + rptr[4] + rptr[6] +
+                                     rptr[8] + rptr[10] + rptr[12] + rptr[14];
+                        float c_val = rptr[c_off];
+                        sig_sum += c_val;
+                        bg_sum += (sum8 - c_val) * (1.0f / 7.0f);
                     }
                 }
                 float ratio = sig_sum / bg_sum;
@@ -1766,6 +1867,7 @@ public:
 
         // Deduplicate nearby local peaks (within 4.5 Hz and 3 quarter-symbols) so we test up to 70 distinct signals
         std::vector<Candidate> cands;
+        cands.reserve(70);
         for (const auto& rc : raw_cands) {
             bool dup = false;
             for (const auto& ex : cands) {
@@ -1780,82 +1882,144 @@ public:
             }
         }
 
-        // Exact 1920-sample orthogonal complex DFT phasor evaluator for symbol starting at `s_idx` and tone frequency `f_hz`
-        auto complex_goertzel_1920 = [&](int s_idx, double f_hz) -> std::complex<float> {
-            if (s_idx < 0 || s_idx + NSPS > static_cast<int>(pcm.size())) return {0.0f, 0.0f};
-            double w = 2.0 * 3.14159265358979323846 * f_hz / 12000.0;
-            double cw = std::cos(w), sw = std::sin(w);
-            double coeff = 2.0 * cw;
-            double q0 = 0.0, q1 = 0.0, q2 = 0.0;
-            const float* p = &pcm[s_idx];
-            for (int i = 0; i < NSPS; ++i) {
-                q0 = p[i] + coeff * q1 - q2;
-                q2 = q1;
-                q1 = q0;
-            }
-            float re = static_cast<float>(q1 - q2 * cw) / NSPS;
-            float im = static_cast<float>(q2 * sw) / NSPS;
-            return {re, im};
+        struct DecodedHit {
+            std::array<uint8_t, 77> msg77;
+            float sync_score;
+            int best_s0;
+            float best_f0;
         };
+        std::vector<DecodedHit> decoded_hits;
+        std::vector<std::array<uint8_t, 77>> seen_msg77;
 
-        std::vector<std::string> seen_msgs;
-        for (const auto& d : band_activity) {
-            if (d.utc_str == utc_buf) seen_msgs.push_back(d.text);
-        }
+        const int pcm_len = static_cast<int>(pcm.size());
+        constexpr double kTwoPiOverFs = 2.0 * 3.14159265358979323846 / 12000.0;
+        constexpr float kInvNsps = 1.0f / static_cast<float>(NSPS);
 
         for (size_t ci = 0; ci < cands.size(); ++ci) {
             const auto& c = cands[ci];
             int base_sample = c.t0_step * STEP;
 
-            // Stage 2: Fine Time (+/- 480 samples in 120-sample = 10ms steps) & Fine Frequency (+/- 2.5 Hz in 0.5 Hz steps)
+            // Stage 2A: 9-lane SIMD Fine Time search (+/- 480 samples in 120-sample = 10ms steps)
             int best_s0 = base_sample;
             float best_f0 = c.f0_hz;
-            float best_fine_sync = -1.0f;
-
-            for (int ds = -480; ds <= 480; ds += 120) {
-                int s0 = base_sample + ds;
-                if (s0 < 0 || s0 + 79 * NSPS > static_cast<int>(pcm.size())) continue;
-                float sync_e = 0.0f;
+            int s0_lanes[9];
+            bool lane_valid[9];
+            bool any_time_valid = false;
+            for (int d = 0; d < 9; ++d) {
+                int s0 = base_sample + (d - 4) * 120;
+                s0_lanes[d] = s0;
+                lane_valid[d] = (s0 >= 0 && s0 + 79 * NSPS <= pcm_len);
+                if (lane_valid[d]) any_time_valid = true;
+            }
+            if (any_time_valid) {
+                float sync_time[9]{};
                 for (int k = 0; k < 7; ++k) {
                     int c_tone = kFt8Costas7[k];
-                    double f_tone = best_f0 + c_tone * 6.25;
-                    sync_e += std::abs(complex_goertzel_1920(s0 + k * NSPS, f_tone));
-                    sync_e += std::abs(complex_goertzel_1920(s0 + (36 + k) * NSPS, f_tone));
-                    sync_e += std::abs(complex_goertzel_1920(s0 + (72 + k) * NSPS, f_tone));
+                    double w = kTwoPiOverFs * (best_f0 + c_tone * 6.25);
+                    double cw = std::cos(w), sw = std::sin(w), coeff = 2.0 * cw;
+                    const int pos[3] = {k, 36 + k, 72 + k};
+                    for (int blk = 0; blk < 3; ++blk) {
+                        const float* ptrs[9];
+                        for (int d = 0; d < 9; ++d) {
+                            ptrs[d] = lane_valid[d] ? (pcm.data() + s0_lanes[d] + pos[blk] * NSPS) : pcm.data();
+                        }
+                        alignas(32) double q1[9]{}, q2[9]{};
+                        for (int i = 0; i < NSPS; ++i) {
+                            for (int d = 0; d < 9; ++d) {
+                                double q0 = static_cast<double>(ptrs[d][i]) + coeff * q1[d] - q2[d];
+                                q2[d] = q1[d];
+                                q1[d] = q0;
+                            }
+                        }
+                        for (int d = 0; d < 9; ++d) {
+                            if (lane_valid[d]) {
+                                float re = static_cast<float>(q1[d] - q2[d] * cw) * kInvNsps;
+                                float im = static_cast<float>(q2[d] * sw) * kInvNsps;
+                                sync_time[d] += std::sqrt(re * re + im * im);
+                            }
+                        }
+                    }
                 }
-                if (sync_e > best_fine_sync) {
-                    best_fine_sync = sync_e;
-                    best_s0 = s0;
+                float best_fine_sync = -1.0f;
+                for (int d = 0; d < 9; ++d) {
+                    if (lane_valid[d] && sync_time[d] > best_fine_sync) {
+                        best_fine_sync = sync_time[d];
+                        best_s0 = s0_lanes[d];
+                    }
+                }
+            }
+            if (best_s0 < 0 || best_s0 + 79 * NSPS > pcm_len) continue;
+
+            // Stage 2B: 11-lane SIMD Fine Frequency search (+/- 2.5 Hz in 0.5 Hz steps, single PCM pass per symbol)
+            {
+                float sync_freq[11]{};
+                for (int k = 0; k < 7; ++k) {
+                    int c_tone = kFt8Costas7[k];
+                    alignas(32) double cw[12]{}, sw[12]{}, coeff[12]{};
+                    for (int f = 0; f < 11; ++f) {
+                        double f_tone = (c.f0_hz + (f - 5) * 0.5) + c_tone * 6.25;
+                        double w = kTwoPiOverFs * f_tone;
+                        cw[f] = std::cos(w);
+                        sw[f] = std::sin(w);
+                        coeff[f] = 2.0 * cw[f];
+                    }
+                    const int pos[3] = {k, 36 + k, 72 + k};
+                    for (int blk = 0; blk < 3; ++blk) {
+                        const float* p = pcm.data() + best_s0 + pos[blk] * NSPS;
+                        alignas(32) double q1[12]{}, q2[12]{};
+                        for (int i = 0; i < NSPS; ++i) {
+                            double x = static_cast<double>(p[i]);
+                            for (int f = 0; f < 11; ++f) {
+                                double q0 = x + coeff[f] * q1[f] - q2[f];
+                                q2[f] = q1[f];
+                                q1[f] = q0;
+                            }
+                        }
+                        for (int f = 0; f < 11; ++f) {
+                            float re = static_cast<float>(q1[f] - q2[f] * cw[f]) * kInvNsps;
+                            float im = static_cast<float>(q2[f] * sw[f]) * kInvNsps;
+                            sync_freq[f] += std::sqrt(re * re + im * im);
+                        }
+                    }
+                }
+                float best_fine_sync = -1.0f;
+                for (int f = 0; f < 11; ++f) {
+                    if (sync_freq[f] > best_fine_sync) {
+                        best_fine_sync = sync_freq[f];
+                        best_f0 = c.f0_hz + (f - 5) * 0.5f;
+                    }
                 }
             }
 
-            best_fine_sync = -1.0f;
-            for (int df_i = -5; df_i <= 5; ++df_i) {
-                float f_try = c.f0_hz + df_i * 0.5f;
-                float sync_e = 0.0f;
-                for (int k = 0; k < 7; ++k) {
-                    int c_tone = kFt8Costas7[k];
-                    double f_tone = f_try + c_tone * 6.25;
-                    sync_e += std::abs(complex_goertzel_1920(best_s0 + k * NSPS, f_tone));
-                    sync_e += std::abs(complex_goertzel_1920(best_s0 + (36 + k) * NSPS, f_tone));
-                    sync_e += std::abs(complex_goertzel_1920(best_s0 + (72 + k) * NSPS, f_tone));
-                }
-                if (sync_e > best_fine_sync) {
-                    best_fine_sync = sync_e;
-                    best_f0 = f_try;
-                }
+            // Stage 2C: 8-lane SIMD complex 8-tone symbol matrix cs[8][79] & magnitude s8[8][79]
+            // Precompute all 8 tone Goertzel coefficients once per candidate (eliminating 632 trig calls)
+            alignas(32) double tone_cw[8], tone_sw[8], tone_coeff[8];
+            for (int m = 0; m < 8; ++m) {
+                double w = kTwoPiOverFs * (best_f0 + m * 6.25);
+                tone_cw[m] = std::cos(w);
+                tone_sw[m] = std::sin(w);
+                tone_coeff[m] = 2.0 * tone_cw[m];
             }
 
-            // Compute complex 8-tone symbol matrix cs[8][79] and magnitude s8[8][79] (exact port of ft8b.f90 lines 155-255)
             std::complex<float> cs[8][79]{};
             float s8[8][79]{};
             for (int k = 0; k < 79; ++k) {
-                int s_idx = best_s0 + k * NSPS;
-                // Continuous phase reference across symbols (since best_f0 * 0.16s may have fractional cycles)
+                const float* p = pcm.data() + best_s0 + k * NSPS;
+                alignas(32) double q1[8]{}, q2[8]{};
+                for (int i = 0; i < NSPS; ++i) {
+                    double x = static_cast<double>(p[i]);
+                    for (int m = 0; m < 8; ++m) {
+                        double q0 = x + tone_coeff[m] * q1[m] - q2[m];
+                        q2[m] = q1[m];
+                        q1[m] = q0;
+                    }
+                }
                 float phi_rot = -static_cast<float>(std::fmod(2.0 * 3.14159265358979323846 * best_f0 * (k * 0.16), 2.0 * 3.14159265358979323846));
                 std::complex<float> rot(std::cos(phi_rot), std::sin(phi_rot));
                 for (int m = 0; m < 8; ++m) {
-                    std::complex<float> z = complex_goertzel_1920(s_idx, best_f0 + m * 6.25) * rot;
+                    float re = static_cast<float>(q1[m] - q2[m] * tone_cw[m]) * kInvNsps;
+                    float im = static_cast<float>(q2[m] * tone_sw[m]) * kInvNsps;
+                    std::complex<float> z = std::complex<float>(re, im) * rot;
                     cs[m][k] = z;
                     s8[m][k] = std::abs(z);
                 }
@@ -1969,14 +2133,29 @@ public:
             }
 
             if (!decoded_ok) continue;
-            std::string decoded_txt = unpack77_message(msg77);
+            if (std::find(seen_msg77.begin(), seen_msg77.end(), msg77) != seen_msg77.end()) continue;
+            seen_msg77.push_back(msg77);
+            decoded_hits.push_back({msg77, c.sync_score, best_s0, best_f0});
+        }
+
+        if (decoded_hits.empty()) return;
+
+        // Stage 4: Acquire `mtx` briefly (<50 us) to unpack 77-bit payloads, commit spots, and advance QSO sequencer
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+        std::vector<std::string> seen_msgs;
+        for (const auto& d : band_activity) {
+            if (d.utc_str == utc_buf) seen_msgs.push_back(d.text);
+        }
+
+        for (const auto& hit : decoded_hits) {
+            std::string decoded_txt = unpack77_message(hit.msg77);
             if (decoded_txt.empty()) continue;
             if (std::find(seen_msgs.begin(), seen_msgs.end(), decoded_txt) != seen_msgs.end()) continue;
             seen_msgs.push_back(decoded_txt);
 
-            int snr = std::clamp(static_cast<int>(std::round(20.0f * std::log10(std::max(0.08f, c.sync_score - 0.95f)) - 14.0f)), -24, +24);
-            float dt = (best_s0 / 12000.0f) - 0.5f;
-            int freq = static_cast<int>(std::round(best_f0));
+            int snr = std::clamp(static_cast<int>(std::round(20.0f * std::log10(std::max(0.08f, hit.sync_score - 0.95f)) - 14.0f)), -24, +24);
+            float dt = (hit.best_s0 / 12000.0f) - 0.5f;
+            int freq = static_cast<int>(std::round(hit.best_f0));
 
             ParsedFtMessage p = parse_ft_message(decoded_txt, my_call);
             bool is_cq = p.is_cq;
