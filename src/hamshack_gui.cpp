@@ -3991,6 +3991,7 @@ public:
     IDWriteTextFormat* font_mono = nullptr;
     IDWriteTextFormat* font_mono_small = nullptr;
     std::unordered_map<int, IDWriteTextFormat*> scaled_mono_fonts;
+    std::unordered_map<int, IDWriteTextFormat*> scaled_ui_fonts;
 
     IDWriteTextFormat* get_scaled_mono_font(float pt_size) {
         int key = static_cast<int>(std::round(pt_size * 10.0f));
@@ -4007,6 +4008,24 @@ public:
             return fmt;
         }
         return font_mono_small;
+    }
+
+    IDWriteTextFormat* get_scaled_ui_font(float pt_size, bool bold = false) {
+        int key = static_cast<int>(std::round(pt_size * 10.0f)) * 2 + (bold ? 1 : 0);
+        auto it = scaled_ui_fonts.find(key);
+        if (it != scaled_ui_fonts.end()) return it->second;
+        if (!dwrite_factory) return bold ? font_ui_bold : font_ui;
+        IDWriteTextFormat* fmt = nullptr;
+        dwrite_factory->CreateTextFormat(L"Segoe UI", nullptr,
+                                         bold ? DWRITE_FONT_WEIGHT_SEMI_BOLD : DWRITE_FONT_WEIGHT_NORMAL,
+                                         DWRITE_FONT_STYLE_NORMAL, DWRITE_FONT_STRETCH_NORMAL,
+                                         pt_size, L"en-us", &fmt);
+        if (fmt) {
+            fmt->SetWordWrapping(DWRITE_WORD_WRAPPING_NO_WRAP);
+            scaled_ui_fonts[key] = fmt;
+            return fmt;
+        }
+        return bold ? font_ui_bold : font_ui;
     }
 
     // ---- Map tile bitmaps (device-dependent: dropped when the render target is recreated) ----
@@ -4197,6 +4216,10 @@ public:
             if (kv.second) kv.second->Release();
         }
         scaled_mono_fonts.clear();
+        for (auto& kv : scaled_ui_fonts) {
+            if (kv.second) kv.second->Release();
+        }
+        scaled_ui_fonts.clear();
         if (wic) wic->Release();
         if (dwrite_factory) dwrite_factory->Release();
         if (d2d_factory) d2d_factory->Release();
@@ -7222,6 +7245,9 @@ static void handle_left_click(HWND hwnd, POINT pt) {
 
     // 1c. Check HamShack++ Top FLRig Deck, Global Tab Bar, and FT8/JS8/CW/APRS/SSTV/FLRig controls
     if (g_hs && hamshack_ui::handle_hamshack_mouse_down(*g_app, *g_hs, pt, hwnd)) {
+        if (g_hs->dragging_wide_graph || g_hs->dragging_wl_sidebar || g_hs->dragging_wl_log || g_hs->gt_map_dragging) {
+            SetCapture(hwnd);
+        }
         return;
     }
 
@@ -7675,7 +7701,8 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
 
         case WM_SETCURSOR:
             if (g_app && LOWORD(lParam) == HTCLIENT) {
-                if (g_app->dragging_splitter == DraggingSplitter::ColumnWidth) {
+                if (g_app->dragging_splitter == DraggingSplitter::ColumnWidth ||
+                    (g_hs && g_hs->dragging_wl_sidebar)) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
                     return TRUE;
                 }
@@ -7686,13 +7713,18 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     }
                 }
                 if (g_app->dragging_splitter == DraggingSplitter::ModuleHeight ||
-                    (g_hs && g_hs->dragging_wide_graph)) {
+                    (g_hs && (g_hs->dragging_wide_graph || g_hs->dragging_wl_log))) {
                     SetCursor(LoadCursor(nullptr, IDC_SIZENS));
                     return TRUE;
                 }
                 if (g_hs) {
                     for (const auto& hh : g_hs->hits) {
-                        if (hh.id == hamshack_ui::HS_WF_RESIZE_BAR &&
+                        if (hh.id == hamshack_ui::HS_WL_SIDEBAR_SPLIT &&
+                            D2DRenderer::pt_in_rect(g_app->mouse_pt, hh.rect)) {
+                            SetCursor(LoadCursor(nullptr, IDC_SIZEWE));
+                            return TRUE;
+                        }
+                        if ((hh.id == hamshack_ui::HS_WF_RESIZE_BAR || hh.id == hamshack_ui::HS_WL_LOG_SPLIT) &&
                             D2DRenderer::pt_in_rect(g_app->mouse_pt, hh.rect)) {
                             SetCursor(LoadCursor(nullptr, IDC_SIZENS));
                             return TRUE;
@@ -7774,6 +7806,22 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                     float dy = static_cast<float>(g_app->mouse_pt.y - g_hs->wf_drag_start_y);
                     if (g_hs->wf_drag_invert) dy = -dy;
                     g_hs->wide_graph_height = std::clamp(g_hs->wf_drag_start_h + dy, 110.0f, 540.0f);
+                    g_last_input_tick = GetTickCount64();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                if (g_hs && g_hs->dragging_wl_sidebar) {
+                    float dx = static_cast<float>(g_hs->wl_drag_start_x - g_app->mouse_pt.x);
+                    g_hs->winlink_sidebar_w = std::clamp(g_hs->wl_drag_start_val + dx, 260.0f, 620.0f);
+                    g_last_input_tick = GetTickCount64();
+                    InvalidateRect(hwnd, nullptr, FALSE);
+                    return 0;
+                }
+
+                if (g_hs && g_hs->dragging_wl_log) {
+                    float dy = static_cast<float>(g_hs->wl_drag_start_y - g_app->mouse_pt.y);
+                    g_hs->winlink_log_extra_h = std::clamp(g_hs->wl_drag_start_val + dy, 0.0f, 280.0f);
                     g_last_input_tick = GetTickCount64();
                     InvalidateRect(hwnd, nullptr, FALSE);
                     return 0;
@@ -7937,6 +7985,17 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
             return 0;
 
         case WM_LBUTTONUP:
+            if (g_hs && (g_hs->dragging_wl_sidebar || g_hs->dragging_wl_log)) {
+                g_hs->dragging_wl_sidebar = false;
+                g_hs->dragging_wl_log = false;
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_sidebar_w = g_hs->winlink_sidebar_w;
+                cfg.winlink_log_extra_h = g_hs->winlink_log_extra_h;
+                cfg.save();
+                ReleaseCapture();
+                InvalidateRect(hwnd, nullptr, FALSE);
+                return 0;
+            }
             if (g_hs && g_hs->dragging_wide_graph) {
                 g_hs->dragging_wide_graph = false;
                 auto& cfg = hamshack::get_app_config();
@@ -8069,6 +8128,31 @@ static LRESULT CALLBACK WndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lPara
                             g_hs->irc_font_size = 13.0f;
                             auto& cfg = hamshack::get_app_config();
                             cfg.irc_font_size = 13.0f;
+                            cfg.save();
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                    } else if (g_hs->active_mode_tab == 7) {
+                        if (wParam == VK_OEM_PLUS || wParam == VK_ADD) {
+                            g_hs->winlink_font_size = std::min(26.0f, g_hs->winlink_font_size + 1.0f);
+                            auto& cfg = hamshack::get_app_config();
+                            cfg.winlink_font_size = g_hs->winlink_font_size;
+                            cfg.save();
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                        if (wParam == VK_OEM_MINUS || wParam == VK_SUBTRACT) {
+                            g_hs->winlink_font_size = std::max(9.0f, g_hs->winlink_font_size - 1.0f);
+                            auto& cfg = hamshack::get_app_config();
+                            cfg.winlink_font_size = g_hs->winlink_font_size;
+                            cfg.save();
+                            InvalidateRect(hwnd, nullptr, FALSE);
+                            return 0;
+                        }
+                        if (wParam == '0' || wParam == VK_NUMPAD0) {
+                            g_hs->winlink_font_size = 13.0f;
+                            auto& cfg = hamshack::get_app_config();
+                            cfg.winlink_font_size = 13.0f;
                             cfg.save();
                             InvalidateRect(hwnd, nullptr, FALSE);
                             return 0;
@@ -8974,6 +9058,36 @@ static void mac_view_key_down(id self, SEL, id event) {
                 g_hs->irc_font_size = 13.0f;
                 auto& cfg = hamshack::get_app_config();
                 cfg.irc_font_size = 13.0f;
+                cfg.save();
+                g_mac_cmd_down = false;
+                mac_flush_display(self);
+                return;
+            }
+        }
+
+        if (g_hs && g_hs->active_mode_tab == 7) {
+            if (key_code == 24 || key_code == 69 || c_ign == '+' || c_ign == '=') { // Cmd+ or Cmd=
+                g_hs->winlink_font_size = std::min(26.0f, g_hs->winlink_font_size + 1.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = g_hs->winlink_font_size;
+                cfg.save();
+                g_mac_cmd_down = false;
+                mac_flush_display(self);
+                return;
+            }
+            if (key_code == 27 || key_code == 78 || c_ign == '-' || c_ign == '_') { // Cmd-
+                g_hs->winlink_font_size = std::max(9.0f, g_hs->winlink_font_size - 1.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = g_hs->winlink_font_size;
+                cfg.save();
+                g_mac_cmd_down = false;
+                mac_flush_display(self);
+                return;
+            }
+            if (key_code == 29 || c_ign == '0') { // Cmd+0
+                g_hs->winlink_font_size = 13.0f;
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = 13.0f;
                 cfg.save();
                 g_mac_cmd_down = false;
                 mac_flush_display(self);

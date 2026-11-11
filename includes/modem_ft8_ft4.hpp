@@ -190,8 +190,10 @@ public:
 
     int active_tx_slot = 5;         // 0..5 = Tx1..Tx6 (default Tx6 = CQ)
     std::array<std::string, 6> tx_msgs;
+    std::string highlighted_call = ""; // Pink highlight callsign (set on single-click or double-click)
 
     std::atomic<bool> qso_prompt_log_pending{false};
+    std::atomic<bool> halt_tx_audio_pending{false};
     std::atomic<uint64_t> cached_dial_hz{14074000ULL};
 
     std::deque<DecodedFtMessage> band_activity;
@@ -568,6 +570,7 @@ public:
         return !out_msg.empty();
     }
 
+public:
     static std::string normalize_call_key(const std::string& raw) {
         std::string out;
         for (char c : raw) {
@@ -577,7 +580,6 @@ public:
         return out;
     }
 
-public:
     static std::vector<std::string> split_words(const std::string& s) {
         std::vector<std::string> w;
         std::stringstream ss(s);
@@ -727,18 +729,72 @@ public:
 
     void start_sequence(int slot = 0) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
+        disarm_after_slot_ = false;
+        disarm_slot_id_ = -1;
         active_tx_slot = std::clamp(slot, 0, 5);
         tx_enabled = true;
         auto_seq = true;
     }
 
-    // Select a decoded station from Band Activity to start or advance a QSO
-    void select_decoded_message(const DecodedFtMessage& d) {
+    // Single-click ONLY highlights the station in pink without selecting it or arming TX
+    void set_highlighted_message(const DecodedFtMessage& d) {
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+        std::string my_norm = normalize_call_key(my_call);
+        ParsedFtMessage p = parse_ft_message(d.text, my_call);
+        std::string stn = normalize_call_key(p.call_from);
+        if (stn == my_norm && !p.call_to.empty() && !p.is_cq) {
+            stn = normalize_call_key(p.call_to);
+        }
+        if (!stn.empty() && stn != "CQ" && stn != "QRZ" && stn != "DE" && stn != "DX") {
+            highlighted_call = stn;
+        }
+    }
+
+    std::string make_qso_dedup_key_locked(const std::string& call_raw) const {
+        std::string ck = normalize_call_key(call_raw);
+        if (ck.empty()) return "";
+        uint64_t dial = cached_dial_hz.load();
+        uint64_t mhz = (dial > 100000ULL) ? (dial / 1000000ULL) : 14ULL;
+        return ck + "|" + (is_ft4 ? "FT4" : "FT8") + "|" + std::to_string(mhz);
+    }
+
+    bool is_qso_already_logged_locked(const std::string& call_raw) const {
+        std::string ck = normalize_call_key(call_raw);
+        if (ck.empty()) return true;
+        std::string cur_mode = is_ft4 ? "FT4" : "FT8";
+        uint64_t dial = cached_dial_hz.load();
+        uint64_t mhz = (dial > 100000ULL) ? (dial / 1000000ULL) : 14ULL;
+        for (const auto& q : qso_log) {
+            if (normalize_call_key(q.call) != ck) continue;
+            if (!q.mode.empty() && q.mode != cur_mode) continue;
+            uint64_t q_mhz = (q.freq_hz > 100000ULL) ? (q.freq_hz / 1000000ULL) : mhz;
+            if (q_mhz == mhz) return true;
+        }
+        return false;
+    }
+
+    bool is_qso_already_logged(const std::string& call_raw) const {
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+        return is_qso_already_logged_locked(call_raw);
+    }
+
+    // Triggers the Add QSO popup AT MOST ONCE per station/band/mode, disregarding already-logged stations
+    void maybe_prompt_log_qso_locked() {
+        if (dx_call.empty()) return;
+        if (is_qso_already_logged_locked(dx_call)) return;
+        std::string key = make_qso_dedup_key_locked(dx_call);
+        if (key.empty() || prompted_qso_keys_.count(key) > 0) return;
+        prompted_qso_keys_.insert(key);
+        qso_prompt_log_pending.store(true);
+    }
+
+    // Select a decoded station (via double-click) to start or advance a QSO and highlight in pink
+    bool select_decoded_message(const DecodedFtMessage& d, bool from_rx_box = false) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
         std::string my_norm = normalize_call_key(my_call);
 
         ParsedFtMessage p = parse_ft_message(d.text, my_call);
-        if (p.call_from.empty()) return;
+        if (p.call_from.empty()) return false;
 
         std::string cand_call = p.call_from;
         std::string cand_grid = is_grid4_str(p.extra) ? p.extra : "";
@@ -770,8 +826,12 @@ public:
         // Under NO circumstances allow calling self or empty/invalid callsign
         if (cand_norm.empty() || cand_norm == my_norm ||
             cand_norm == "CQ" || cand_norm == "QRZ" || cand_norm == "DE" || cand_norm == "DX") {
-            return;
+            return false;
         }
+
+        highlighted_call = cand_norm;
+        disarm_after_slot_ = false;
+        disarm_slot_id_ = -1;
 
         rx_freq_hz = d.freq_hz;
         if (!hold_tx_freq) tx_freq_hz = d.freq_hz;
@@ -786,22 +846,36 @@ public:
         regenerate_std_msgs_locked();
         active_tx_slot = target_slot;
 
-        rx_freq_activity.push_back(d);
-        if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
+        // Never add extra duplicate lines when double-clicking inside RX Frequency box (or if already copied)
+        if (!from_rx_box) {
+            bool dup = false;
+            size_t n_rx = rx_freq_activity.size();
+            for (size_t i = (n_rx > 12 ? n_rx - 12 : 0); i < n_rx; ++i) {
+                if (rx_freq_activity[i].utc_str == d.utc_str && rx_freq_activity[i].text == d.text) {
+                    dup = true;
+                    break;
+                }
+            }
+            if (!dup) {
+                rx_freq_activity.push_back(d);
+                if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
+            }
+        }
+        return true;
     }
 
-    // Double-clicking a CQ starts transmission immediately if there are 10s or more left
-    // in the transmission window, but ONLY if the current slot is the opposite period from the rx window.
-    bool on_double_click_message(const DecodedFtMessage& d, SoundcardEngine& audio, bool& out_want_ptt) {
+    // Double-clicking a station highlights it in pink, selects it to reply to, arms TX, and starts
+    // transmitting immediately (with NO 10-second time limit!) if currently in our opposite TX period.
+    bool on_double_click_message(const DecodedFtMessage& d, SoundcardEngine& audio, bool& out_want_ptt, bool from_rx_box = false) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        select_decoded_message(d);
-        tx_enabled = true;
-
-        ParsedFtMessage p = parse_ft_message(d.text, my_call);
-        bool is_cq = p.is_cq || (d.text.rfind("CQ ", 0) == 0);
-        if (!is_cq) {
+        if (!select_decoded_message(d, from_rx_box)) {
             return false;
         }
+        if (active_tx_slot == 5) {
+            tx_enabled = false;
+            return false;
+        }
+        tx_enabled = true;
 
         bool rx_is_even = d.determine_rx_is_even();
         tx_even_first = !rx_is_even;
@@ -810,26 +884,26 @@ public:
         auto now = system_clock::now();
         double epoch_s = duration_cast<milliseconds>(now.time_since_epoch()).count() / 1000.0;
         double period = is_ft4 ? 7.5 : 15.0;
+        double tx_dur = is_ft4 ? 5.04 : 12.64;
         double in_slot = std::fmod(epoch_s, period);
-        int current_slot_id = static_cast<int>(std::floor(epoch_s / period));
-        bool current_is_even = (current_slot_id % 2) == 0;
+        int slot_now = static_cast<int>(std::floor(epoch_s / period));
+        bool current_is_even = (slot_now % 2) == 0;
 
-        // "only if its the opposite period from the rx window"
         bool is_opposite = (current_is_even != rx_is_even);
-        if (!is_opposite) {
-            return false; // Same period as CQ RX window -> wait for beginning of next opposite slot
+        if (!is_opposite || in_slot >= tx_dur - 0.15) {
+            return false; // Same period as RX window (or slot already ended) -> armed for next opposite slot
         }
 
-        // "if there's 10 seconds or more left, start the transmission please"
-        double time_left = period - in_slot;
-        double min_req = is_ft4 ? 5.0 : 10.0;
-        if (time_left < min_req) {
-            return false; // Less than 10s left in this window -> wait for next opposite slot
+        // Prevent duplicate trigger if both click-timer and OS double-click fire on the exact same slot & station
+        if (last_tx_slot_id == slot_now && transmitting_now && audio.is_tx_active() &&
+            normalize_call_key(dx_call) == highlighted_call) {
+            return true;
         }
 
-        // Start transmission immediately!
-        last_tx_slot_id = current_slot_id;
-        std::string msg_to_send = tx_msgs[std::clamp(active_tx_slot, 0, 5)];
+        // Start transmission immediately in phase with UTC slot (no time-remaining cutoff!)
+        last_tx_slot_id = slot_now;
+        int sent_slot_idx = std::clamp(active_tx_slot, 0, 5);
+        std::string msg_to_send = tx_msgs[sent_slot_idx];
         std::vector<float> wave;
         if (is_ft4) {
             auto tones = gen_ft4_tones(msg_to_send);
@@ -839,10 +913,23 @@ public:
             wave = synthesize_gfsk_wave(tones.data(), 79, 1920, 2.0f, static_cast<float>(tx_freq_hz));
         }
 
+        // Slice elapsed samples so late-in-slot TX stays synchronized with WSJT-X UTC symbol timing
+        double elapsed_wave_s = std::max(0.0, in_slot - 0.50);
+        size_t skip_samples = static_cast<size_t>(elapsed_wave_s * 12000.0);
+        if (skip_samples > 0 && skip_samples + 1200 < wave.size()) {
+            wave.erase(wave.begin(), wave.begin() + static_cast<std::ptrdiff_t>(skip_samples));
+            constexpr float kPi = 3.14159265358979323846f;
+            size_t ramp = std::min<size_t>(120, wave.size());
+            for (size_t i = 0; i < ramp; ++i) {
+                wave[i] *= 0.5f * (1.0f - std::cos(kPi * static_cast<float>(i) / static_cast<float>(ramp)));
+            }
+        }
+
+        double rem_dur = std::max(0.2, (tx_dur + 0.50) - in_slot);
         audio.halt_tx();
         audio.queue_tx_samples(wave);
         audio.add_synth_waterfall_signal(static_cast<float>(tx_freq_hz), is_ft4 ? 85.0f : 50.0f, +6.0f, is_ft4 ? 1 : 0,
-                                         static_cast<uint64_t>(time_left * 1000));
+                                         static_cast<uint64_t>(rem_dur * 1000));
 
         std::time_t tt = system_clock::to_time_t(now);
         std::tm gm{};
@@ -850,10 +937,17 @@ public:
         char cur_utc[16];
         std::snprintf(cur_utc, sizeof(cur_utc), "%02d%02d%02d", gm.tm_hour, gm.tm_min, (gm.tm_sec / 15) * 15);
         DecodedFtMessage tx_rec{cur_utc, 0, 0.0f, tx_freq_hz, is_ft4, msg_to_send,
-                                msg_to_send.rfind("CQ ", 0) == 0, false, true, current_is_even, current_slot_id};
+                                msg_to_send.rfind("CQ ", 0) == 0, false, true, current_is_even, slot_now};
         rx_freq_activity.push_back(tx_rec);
         if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
         last_sent_msg_ = msg_to_send;
+
+        // If transmitting the final message in the chain (RR73 or 73), prompt Log QSO now and disarm after slot finishes
+        if (auto_seq && (sent_slot_idx == 3 || sent_slot_idx == 4)) {
+            maybe_prompt_log_qso_locked();
+            disarm_after_slot_ = true;
+            disarm_slot_id_ = slot_now;
+        }
 
         transmitting_now = true;
         out_want_ptt = true;
@@ -864,11 +958,14 @@ public:
     void halt_tx_and_clear_working(SoundcardEngine& audio) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
         tx_enabled = false;
+        disarm_after_slot_ = false;
+        disarm_slot_id_ = -1;
         tune_active = false;
         transmitting_now = false;
         audio.halt_tx();
         dx_call.clear();
         dx_grid.clear();
+        highlighted_call.clear();
         active_tx_slot = 5; // Reset sequence back to calling CQ
         regenerate_std_msgs_locked();
     }
@@ -1087,6 +1184,8 @@ public:
 
         LoggedQso q{d_buf, t_buf, dx_call, dx_grid, is_ft4 ? "FT4" : "FT8", rig_freq_hz, rs_buf, rr_buf, "", false};
         qso_log.push_back(q);
+        std::string dedup_k = make_qso_dedup_key_locked(q.call);
+        if (!dedup_k.empty()) prompted_qso_keys_.insert(dedup_k);
         record_worked_station_locked(q.call, q.grid, false);
         adif_status_text = "hamshack_wsjtx_log.adi (" + std::to_string(qso_log.size()) + " QSOs, " +
                            std::to_string(worked_calls.size()) + " calls, " +
@@ -1263,6 +1362,22 @@ public:
         char utc_buf[16];
         std::snprintf(utc_buf, sizeof(utc_buf), "%02d%02d%02d", gm.tm_hour, gm.tm_min, (gm.tm_sec / 15) * 15);
 
+        if (halt_tx_audio_pending.exchange(false)) {
+            audio.halt_tx();
+            transmitting_now = false;
+            out_want_ptt = false;
+        }
+
+        // Complete deferred disarm once the final RR73 / 73 TX slot ends
+        double tx_dur = is_ft4 ? 5.04 : 12.64;
+        double guard_end = period - 0.25;
+        if (disarm_after_slot_ && (slot_id != disarm_slot_id_ || in_slot >= guard_end)) {
+            disarm_after_slot_ = false;
+            disarm_slot_id_ = -1;
+            tx_enabled = false;
+            active_tx_slot = 5;
+        }
+
         if (tune_active) {
             out_want_ptt = true;
             transmitting_now = true;
@@ -1278,12 +1393,11 @@ public:
         }
 
         // Check if we should transmit in our designated even/odd slot
-        double tx_dur = is_ft4 ? 5.04 : 12.64;
-        double guard_end = period - 0.25;
         if (tx_enabled && (is_even_slot == tx_even_first) && in_slot < guard_end) {
             if (last_tx_slot_id != slot_id && in_slot < tx_dur) {
                 last_tx_slot_id = slot_id;
-                std::string msg_to_send = tx_msgs[std::clamp(active_tx_slot, 0, 5)];
+                int sent_slot_idx = std::clamp(active_tx_slot, 0, 5);
+                std::string msg_to_send = tx_msgs[sent_slot_idx];
                 std::vector<float> wave;
                 if (is_ft4) {
                     auto tones = gen_ft4_tones(msg_to_send);
@@ -1302,18 +1416,12 @@ public:
                 if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
                 last_sent_msg_ = msg_to_send;
 
-                // Automatic sequence advancement just like WSJT-X
-                if (auto_seq) {
-                    if (active_tx_slot == 3) {
-                        // After sending RR73, prompt to log QSO and advance to Tx5 (73)
-                        qso_prompt_log_pending.store(true);
-                        active_tx_slot = 4;
-                    } else if (active_tx_slot == 4) {
-                        // After sending 73, sequence is complete: prompt to log QSO, disarm Tx and reset to CQ
-                        qso_prompt_log_pending.store(true);
-                        active_tx_slot = 5;
-                        tx_enabled = false;
-                    }
+                // WSJT-X exact Log QSO timing: prompt ONLY when starting transmission of the final
+                // message in the chain (Tx4 RR73 or Tx5 73), and let the full slot finish before disarming!
+                if (auto_seq && (sent_slot_idx == 3 || sent_slot_idx == 4)) {
+                    maybe_prompt_log_qso_locked();
+                    disarm_after_slot_ = true;
+                    disarm_slot_id_ = slot_id;
                 }
             }
             transmitting_now = audio.is_tx_active();
@@ -1371,6 +1479,9 @@ private:
     int nrw_[83]{};
     int mn_[174][3]{};
     std::string last_sent_msg_;
+    bool disarm_after_slot_ = false;
+    int disarm_slot_id_ = -1;
+    std::unordered_set<std::string> prompted_qso_keys_;
 
     std::atomic<int> manual_slot_counter_{100};
     std::mutex decode_job_mtx_;
@@ -2172,36 +2283,70 @@ public:
                 hamshack::get_psk_reporter().post_spot(p.call_from, is_grid4_str(p.extra) ? p.extra : "", dial + static_cast<uint64_t>(std::max(0, freq)), snr, is_ft4 ? "FT4" : "FT8");
             }
 
+            // WSJT-X Halt TX rule: stop sending immediately if the station we are transmitting to
+            // answers/works someone else, or another station's QSO reply to our target is decoded.
+            if (tx_enabled && !dx_call.empty() && active_tx_slot < 5) {
+                std::string dx_norm = normalize_call_key(dx_call);
+                std::string my_norm = normalize_call_key(my_call);
+                std::string from_norm = normalize_call_key(p.call_from);
+                std::string to_norm = normalize_call_key(p.call_to);
+                bool dx_working_other = (from_norm == dx_norm && !p.is_cq && !for_me && !to_norm.empty());
+                bool other_in_qso_with_dx = (active_tx_slot == 0 && to_norm == dx_norm &&
+                                             !from_norm.empty() && from_norm != my_norm &&
+                                             !p.is_cq && !p.extra.empty() && !is_grid4_str(p.extra));
+                if (dx_working_other || other_in_qso_with_dx) {
+                    tx_enabled = false;
+                    disarm_after_slot_ = false;
+                    disarm_slot_id_ = -1;
+                    halt_tx_audio_pending.store(true);
+                }
+            }
+
             if (for_me || std::abs(freq - rx_freq_hz) <= 60) {
                 rx_freq_activity.push_back(d);
                 if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
                 if (for_me && auto_seq) {
-                    if (!p.call_from.empty() && p.call_from != my_call) {
-                        dx_call = p.call_from;
-                    }
-                    if (is_grid4_str(p.extra)) {
-                        dx_grid = p.extra;
-                    }
+                    std::string from_norm = normalize_call_key(p.call_from);
+                    std::string dx_norm = normalize_call_key(dx_call);
+                    bool already_logged = is_qso_already_logged_locked(p.call_from);
+                    std::string dedup_k = make_qso_dedup_key_locked(p.call_from);
+                    bool already_prompted = (!dedup_k.empty() && prompted_qso_keys_.count(dedup_k) > 0);
 
-                    if (p.extra == "RR73" || p.extra == "RRR") {
-                        active_tx_slot = 4; // Tx5: 73
-                        qso_prompt_log_pending.store(true);
-                    } else if (p.extra == "73") {
-                        active_tx_slot = 5; // Tx6: CQ
-                        tx_enabled = false;
-                        qso_prompt_log_pending.store(true);
-                    } else if (p.extra.rfind("R+", 0) == 0 || p.extra.rfind("R-", 0) == 0) {
-                        rpt_rcvd = std::atoi(p.extra.c_str() + 1);
-                        active_tx_slot = 3; // Tx4: RR73
-                    } else if (p.extra.rfind("+", 0) == 0 || p.extra.rfind("-", 0) == 0) {
-                        rpt_rcvd = std::atoi(p.extra.c_str());
-                        active_tx_slot = 2; // Tx3: R<rpt>
-                    } else {
-                        // Initial caller replying to our CQ
-                        rpt_sent = snr;
-                        active_tx_slot = 1; // Tx2: <rpt>
+                    if (p.extra == "73") {
+                        if (dx_norm.empty() || from_norm == dx_norm) {
+                            active_tx_slot = 5; // Tx6: CQ
+                            tx_enabled = false;
+                            disarm_after_slot_ = false;
+                            disarm_slot_id_ = -1;
+                        }
+                    } else if (already_logged || (already_prompted && !tx_enabled)) {
+                        // Already logged (or already completed/prompted): disregard!
+                    } else if (dx_norm.empty() || active_tx_slot == 5 || !tx_enabled || from_norm == dx_norm) {
+                        if (!p.call_from.empty() && p.call_from != my_call) {
+                            dx_call = p.call_from;
+                            highlighted_call = from_norm;
+                        }
+                        if (is_grid4_str(p.extra)) {
+                            dx_grid = p.extra;
+                        }
+
+                        if (p.extra == "RR73" || p.extra == "RRR") {
+                            active_tx_slot = 4; // Tx5: 73 (Log QSO popup will open when we transmit 73!)
+                            disarm_after_slot_ = false;
+                            disarm_slot_id_ = -1;
+                        } else if (p.extra.rfind("R+", 0) == 0 || p.extra.rfind("R-", 0) == 0) {
+                            rpt_rcvd = std::atoi(p.extra.c_str() + 1);
+                            active_tx_slot = 3; // Tx4: RR73 (Log QSO popup will open when we transmit RR73!)
+                        } else if (p.extra.rfind("+", 0) == 0 || p.extra.rfind("-", 0) == 0) {
+                            rpt_rcvd = std::atoi(p.extra.c_str());
+                            active_tx_slot = 2; // Tx3: R<rpt>
+                        } else {
+                            // Initial caller replying to our CQ
+                            rpt_sent = snr;
+                            active_tx_slot = 1; // Tx2: <rpt>
+                        }
+                        regenerate_std_msgs_locked();
                     }
-                    regenerate_std_msgs_locked();
                 }
             }
         }

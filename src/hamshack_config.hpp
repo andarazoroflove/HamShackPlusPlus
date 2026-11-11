@@ -79,6 +79,9 @@ struct AppConfig {
     std::string winlink_selected_gateway = "";
     uint64_t winlink_selected_freq = 0;
     std::string winlink_selected_mode = "ARDOP 1000";
+    float winlink_font_size = 13.0f;
+    float winlink_sidebar_w = 380.0f;
+    float winlink_log_extra_h = 0.0f;
 
     // Web Reporting (PSK Reporter IPFIX Push)
     bool web_reporting_enabled = true;
@@ -187,6 +190,9 @@ struct AppConfig {
         f << "winlink_selected_gateway=" << winlink_selected_gateway << "\n";
         f << "winlink_selected_freq=" << winlink_selected_freq << "\n";
         f << "winlink_selected_mode=" << winlink_selected_mode << "\n";
+        f << "winlink_font_size=" << winlink_font_size << "\n";
+        f << "winlink_sidebar_w=" << winlink_sidebar_w << "\n";
+        f << "winlink_log_extra_h=" << winlink_log_extra_h << "\n";
         f << "web_reporting=" << (web_reporting_enabled ? 1 : 0) << "\n";
         f << "window_width=" << window_width << "\n";
         f << "window_height=" << window_height << "\n";
@@ -290,6 +296,18 @@ struct AppConfig {
             else if (key == "winlink_selected_gateway") winlink_selected_gateway = val;
             else if (key == "winlink_selected_freq") winlink_selected_freq = std::strtoull(val.c_str(), nullptr, 10);
             else if (key == "winlink_selected_mode") winlink_selected_mode = val;
+            else if (key == "winlink_font_size") {
+                float sz = static_cast<float>(std::atof(val.c_str()));
+                if (sz >= 9.0f && sz <= 26.0f) winlink_font_size = sz;
+            }
+            else if (key == "winlink_sidebar_w") {
+                float sw = static_cast<float>(std::atof(val.c_str()));
+                if (sw >= 260.0f && sw <= 760.0f) winlink_sidebar_w = sw;
+            }
+            else if (key == "winlink_log_extra_h") {
+                float lh = static_cast<float>(std::atof(val.c_str()));
+                if (lh >= 0.0f && lh <= 400.0f) winlink_log_extra_h = lh;
+            }
             else if (key == "web_reporting") web_reporting_enabled = (val == "1");
             else if (key == "window_width") {
                 double w = std::atof(val.c_str());

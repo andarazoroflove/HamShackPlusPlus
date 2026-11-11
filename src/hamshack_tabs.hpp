@@ -292,6 +292,14 @@ enum HsHitId : int {
     HS_WL_CFG_CMS_PASS_BOX  = 1730,
     HS_WL_CFG_CMS_TMO_BOX   = 1731,
     HS_WL_CFG_CMS_RESET_BTN = 1732,
+    HS_WL_ZOOM_OUT          = 1733,
+    HS_WL_ZOOM_RESET        = 1734,
+    HS_WL_ZOOM_IN           = 1735,
+    HS_WL_GW_REFRESH_BTN    = 1736,
+    HS_WL_SIDEBAR_SPLIT     = 1737,
+    HS_WL_LOG_SPLIT         = 1738,
+    HS_WL_LOG_TALLER        = 1739,
+    HS_WL_LOG_SHORTER       = 1740,
 
     // Carbon Engine Tabs: APRS (Tab 9) & SSTV (Tab 10) + Lock-Free AudioRouter Dropdown
     HS_TAB_APRS             = 1810,
@@ -485,6 +493,14 @@ struct HamShackSuite {
 
     std::string wl_cms_port_edit = "8772";
     std::string wl_cms_timeout_edit = "30";
+    float winlink_font_size = 13.0f;
+    float winlink_sidebar_w = 380.0f;
+    float winlink_log_extra_h = 0.0f;
+    bool dragging_wl_sidebar = false;
+    bool dragging_wl_log = false;
+    int wl_drag_start_x = 0;
+    int wl_drag_start_y = 0;
+    float wl_drag_start_val = 0.0f;
 
     std::vector<HsHitRect> hits;
 
@@ -521,6 +537,9 @@ struct HamShackSuite {
         }
         wl_cms_port_edit = std::to_string((cfg.winlink_cms_port >= 1 && cfg.winlink_cms_port <= 65535) ? cfg.winlink_cms_port : 8772);
         wl_cms_timeout_edit = std::to_string(std::clamp(cfg.winlink_cms_timeout_sec, 5, 300));
+        winlink_font_size = std::clamp(cfg.winlink_font_size, 9.0f, 26.0f);
+        winlink_sidebar_w = std::clamp(cfg.winlink_sidebar_w, 260.0f, 620.0f);
+        winlink_log_extra_h = std::clamp(cfg.winlink_log_extra_h, 0.0f, 280.0f);
         winlink.modem_info = cfg.winlink_cms_server + ":" + wl_cms_port_edit + " (" + cfg.winlink_cms_call + " • " + wl_cms_timeout_edit + "s)";
 
         // Initialize Carbon Engine lock-free AudioRouter, APRS KISS/AX.25 Engine, and 14-Mode SSTV Transceiver
@@ -656,7 +675,7 @@ struct HamShackSuite {
         js8.cached_dial_hz.store(flrig.connected ? flrig.vfo_a_hz : 7078000ULL);
 
         if (ft8.qso_prompt_log_pending.exchange(false)) {
-            if (!log_qso_dialog.is_open && !ft8.dx_call.empty()) {
+            if (!log_qso_dialog.is_open && !ft8.dx_call.empty() && !ft8.is_qso_already_logged(ft8.dx_call)) {
                 log_qso_dialog.open_for_current_ft8(ft8, dial_hz);
                 text_focus = HsTextFocus::LogQsoComm;
             }
@@ -1785,23 +1804,25 @@ inline void render_global_bottom_tab_bar(RendererT& r, AppT& app, HamShackSuite&
         int hit_id;
         int idx;
         const char* label;
+        const char* compact_label;
         uint32_t color;
     };
     static constexpr GlobalTabSpec kGlobalTabs[11] = {
-        {HS_TAB_FT8,    0,  "FT8 / FT4",     0x00E5FF},
-        {HS_TAB_JS8,    1,  "JS8Call",       0x10B981},
-        {HS_TAB_CW,     2,  "CW Keyer",      0xFBBF24},
-        {HS_TAB_APRS,   9,  "APRS",          0x22D3EE},
-        {HS_TAB_SSTV,   10, "SSTV",          0xF472B6},
-        {HS_TAB_WINLINK,7,  "Winlink",       0x34D399},
-        {HS_TAB_MESH,   3,  "MeshCore",      0xA855F7},
-        {HS_TAB_GT,     4,  "Grid Tracker",  0xF59E0B},
-        {HS_TAB_PAGES,  5,  "Pages",         0x38BDF8},
-        {HS_TAB_IRC,    6,  "IRC",           0xEC4899},
-        {HS_TAB_CONFIG, 8,  "Configuration", 0x94A3B8}
+        {HS_TAB_FT8,    0,  "📡 FT8 / FT4",    "📡 FT8/FT4",     0x00E5FF},
+        {HS_TAB_JS8,    1,  "💬 JS8Call",      "💬 JS8Call",     0x10B981},
+        {HS_TAB_CW,     2,  "⚡ CW Keyer",     "⚡ CW Keyer",    0xFBBF24},
+        {HS_TAB_APRS,   9,  "📍 APRS",         "📍 APRS",        0x22D3EE},
+        {HS_TAB_SSTV,   10, "🖼 SSTV",         "🖼 SSTV",        0xF472B6},
+        {HS_TAB_WINLINK,7,  "✉ Winlink",       "✉ Winlink",      0x34D399},
+        {HS_TAB_GT,     4,  "🌐 Grid Tracker", "🌐 GridTracker", 0xF59E0B},
+        {HS_TAB_MESH,   3,  "🔗 Meshcore++",   "🔗 Meshcore++",  0xA855F7},
+        {HS_TAB_PAGES,  5,  "🧭 Pages",        "🧭 Pages",       0x38BDF8},
+        {HS_TAB_IRC,    6,  "🗨 IRC",          "🗨 IRC",         0xEC4899},
+        {HS_TAB_CONFIG, 8,  "⚙ Configuration", "⚙ Config",       0x94A3B8}
     };
 
-    float tab_w = std::min(134.0f, (W - 20.0f - 10 * 4.0f) / 11.0f);
+    float tab_w = std::min(138.0f, (W - 20.0f - 10 * 4.0f) / 11.0f);
+    auto* tab_font = r.get_scaled_ui_font(tab_w < 118.0f ? 11.2f : 12.2f, true);
     for (int i = 0; i < 11; ++i) {
         float tx = 10.0f + i * (tab_w + 4.0f);
         D2D1_RECT_F tr = D2D1::RectF(tx, bar_y, tx + tab_w, bar_y + bar_h);
@@ -1811,7 +1832,8 @@ inline void render_global_bottom_tab_bar(RendererT& r, AppT& app, HamShackSuite&
                                   : hov ? r.hex_color(0x1E293B)
                                         : r.hex_color(0x131C2E));
         r.draw_round_rect(tr, 6.0f, sel ? r.hex_color(kGlobalTabs[i].color) : r.hex_color(0x26354D), sel ? 1.8f : 1.0f);
-        r.draw_text(kGlobalTabs[i].label, r.font_ui_bold, tr,
+        const char* lbl = (tab_w < 122.0f) ? kGlobalTabs[i].compact_label : kGlobalTabs[i].label;
+        r.draw_text(lbl, tab_font, tr,
                     sel ? r.hex_color(kGlobalTabs[i].color) : r.hex_color(0xCBD5E1),
                     DWRITE_TEXT_ALIGNMENT_CENTER);
         hs.add_hit(tr, kGlobalTabs[i].hit_id, kGlobalTabs[i].idx);
@@ -1924,20 +1946,29 @@ inline void render_ft8_ft4_workspace(RendererT& r, HamShackSuite& hs, POINT mous
 
             std::string call_s, grid_s, az_s;
             extract_call_grid(d.text, call_s, grid_s, az_s);
+            std::string norm_call = hamshack::Ft8Ft4Engine::normalize_call_key(call_s);
             bool worked_before = hs.ft8.is_call_worked(call_s);
             bool being_worked = (!hs.ft8.dx_call.empty() &&
-                                 hamshack::Ft8Ft4Engine::normalize_call_key(call_s) == hamshack::Ft8Ft4Engine::normalize_call_key(hs.ft8.dx_call));
+                                 norm_call == hamshack::Ft8Ft4Engine::normalize_call_key(hs.ft8.dx_call));
+            bool is_pink_sel = (!hs.ft8.highlighted_call.empty() && !norm_call.empty() &&
+                                norm_call == hs.ft8.highlighted_call);
 
-            if (being_worked) {
-                // Light green highlight behind station being worked in FT8/FT4 modes (Requirement 1)
+            if (is_pink_sel) {
+                // Single-clicked or double-clicked station highlighted in pink!
+                r.fill_round_rect(rr, 3.0f, r.hex_color(0xEC4899, 0.44f));
+                r.draw_round_rect(rr, 3.0f, r.hex_color(0xF472B6, 0.95f), 1.4f);
+            } else if (d.is_for_me) {
+                // Any station calling me highlighted in bright electric blue so active callers stand out immediately!
+                r.fill_round_rect(rr, 3.0f, r.hex_color(0x0088FF, 0.46f));
+                r.draw_round_rect(rr, 3.0f, r.hex_color(0x38BDF8, 0.95f), 1.4f);
+            } else if (being_worked) {
+                // Light green highlight behind station being worked in FT8/FT4 modes
                 r.fill_round_rect(rr, 3.0f, r.hex_color(0x22C55E, 0.40f));
                 r.draw_round_rect(rr, 3.0f, r.hex_color(0x4ADE80, 0.90f), 1.2f);
             } else if (worked_before) {
                 // Yellow highlight behind previously worked contacts (from WSJT-X .adi or session log)
                 r.fill_round_rect(rr, 3.0f, r.hex_color(0xEAB308, 0.36f));
                 r.draw_round_rect(rr, 3.0f, r.hex_color(0xFACC15, 0.85f), 1.0f);
-            } else if (d.is_for_me) {
-                r.fill_round_rect(rr, 3.0f, r.hex_color(0xEF4444, 0.25f));
             } else if (d.is_cq) {
                 r.fill_round_rect(rr, 3.0f, r.hex_color(0x10B981, 0.20f));
             } else if (d.is_tx) {
@@ -1964,15 +1995,19 @@ inline void render_ft8_ft4_workspace(RendererT& r, HamShackSuite& hs, POINT mous
             if (rf_hz > 0) std::snprintf(rf_buf, sizeof(rf_buf), "%9.5f", rf_hz / 1e6);
             else           std::snprintf(rf_buf, sizeof(rf_buf), "   ---   ");
 
-            std::string msg_disp = being_worked ? (d.text + " [WORKING]") : (worked_before ? (d.text + " [WORKED]") : d.text);
+            std::string msg_disp = being_worked ? (d.text + " [WORKING]")
+                                 : d.is_for_me  ? (d.text + " [CALLING YOU]")
+                                 : worked_before ? (d.text + " [WORKED]")
+                                 : d.text;
             char line_buf[240];
             std::snprintf(line_buf, sizeof(line_buf), "%-6s  %-4s  %+3ddB  %4.1f  %4dHz  %s   %-8s   %-4s   %-11s  %s",
                           d.utc_str.c_str(), d.is_ft4 ? "FT4" : "FT8", d.snr_db, d.dt_sec, d.freq_hz,
                           rf_buf, call_s.c_str(), grid_s.c_str(), az_s.c_str(), msg_disp.c_str());
 
-            D2D1_COLOR_F col = being_worked  ? r.hex_color(0x86EFAC)
+            D2D1_COLOR_F col = is_pink_sel   ? r.hex_color(0xFBCFE8)
+                             : d.is_for_me   ? r.hex_color(0xBAE6FD)
+                             : being_worked  ? r.hex_color(0x86EFAC)
                              : worked_before ? r.hex_color(0xFEF08A)
-                             : d.is_for_me   ? r.hex_color(0xFCA5A5)
                              : d.is_cq       ? r.hex_color(0x34D399)
                              : d.is_tx       ? r.hex_color(0xFBBF24)
                                              : r.hex_color(0xE2E8F0);
@@ -2963,7 +2998,6 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
                                    void* ns_view_ptr, float x, float y, float w, float h) {
     render_live_g90_telemetry_grid(r, hs, x, y, w, 38.0f);
 
-    // 2. Pages Sub-Tab Bar (y + 42.0f .. y + 74.0f, 32px height) — QRZ is first!
     static constexpr const char* kPageTitles[5] = {
         "QRZ Callsign Database",
         "PSKReporter Live Map",
@@ -2971,15 +3005,32 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
         "DXLook HF Matrix",
         "OpenHamClock"
     };
-    float stw = (w - 16.0f) / 5.0f;
-    for (int i = 0; i < 5; ++i) {
-        bool act = (hs.active_page_subtab == i);
-        uint32_t col = (i == 0) ? 0xF59E0B : 0x00E5FF;
-        draw_hs_btn(r, hs, mouse_pt, x + i * (stw + 4.0f), y + 42.0f, stw, 28.0f,
-                    HS_PAGE_SUBTAB_BASE + i, kPageTitles[i], act, col, i, "", true);
+
+    // Layout: WebView fills top/main workspace; URL + Bookmark bar sits just above the 5 site tabs,
+    // and the 5 site tabs sit at the very bottom right above the global bottom tab bar!
+    float sites_y = y + h - 28.0f;
+    float t_y     = y + h - 64.0f;
+    float web_top = y + 42.0f;
+    float web_h   = std::max(100.0f, (t_y - 4.0f) - web_top);
+
+    std::string live_url = hamshack_web::get_web_maps().current_url(hs.active_page_subtab);
+
+    // 1. Synchronize live WebView2 / WKWebView position and visibility in top/main area
+    hamshack_web::get_web_maps().sync_visibility(ns_view_ptr, hs.active_page_subtab, x, web_top, w, web_h);
+    if (!hamshack_web::get_web_maps().has_native_webview()) {
+        D2D1_RECT_F fb_r = D2D1::RectF(x, web_top, x + w, web_top + web_h);
+        r.fill_round_rect(fb_r, 8.0f, r.hex_color(0x0B111E));
+        r.draw_round_rect(fb_r, 8.0f, r.hex_color(0x1E293B), 1.2f);
+        float cy = web_top + web_h * 0.35f;
+        r.draw_text(kPageTitles[hs.active_page_subtab], r.font_title,
+                    D2D1::RectF(x + 20, cy, x + w - 20, cy + 32), r.hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
+        r.draw_text(live_url, r.font_mono,
+                    D2D1::RectF(x + 20, cy + 36, x + w - 20, cy + 62), r.hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
+        draw_hs_btn(r, hs, mouse_pt, x + w * 0.5f - 130.0f, cy + 76.0f, 260.0f, 36.0f,
+                    HS_WEB_EXTERNAL, "↗ Open Live Page in Browser", true, 0x10B981, 0, "", true);
     }
 
-    float t_y = y + 74.0f;
+    // 2. URL + Bookmark + Zoom Bar (just above the site tabs)
     D2D1_RECT_F tb_r = D2D1::RectF(x, t_y, x + w, t_y + 32.0f);
     r.fill_round_rect(tb_r, 6.0f, r.hex_color(0x0F172A));
     r.draw_round_rect(tb_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
@@ -2989,8 +3040,6 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
     draw_hs_btn(r, hs, mouse_pt, x + 150.0f, t_y + 3.0f, 76, 26, HS_WEB_RELOAD, "⟳ Reload",false, 0x00E5FF, 0, "", true);
     draw_hs_btn(r, hs, mouse_pt, x + 230.0f, t_y + 3.0f, 68, 26, HS_WEB_HOME,   "⌂ Home",  false, 0x10B981, 0, "", true);
 
-    // Live URL display and edit box (Requirement 7)
-    std::string live_url = hamshack_web::get_web_maps().current_url(hs.active_page_subtab);
     float cur_x = x + 304.0f;
     float right_ctrl_w = 460.0f;
     float url_w = std::max(120.0f, (x + w - right_ctrl_w) - cur_x);
@@ -3005,11 +3054,9 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
     hs.add_hit(ubox, HS_PAGE_URL_BOX);
 
     float rx = cur_x + url_w + 6.0f;
-    // [★ Bookmark] Button
     draw_hs_btn(r, hs, mouse_pt, rx, t_y + 3.0f, 100, 26, HS_PAGE_BOOKMARK, "★ Bookmark", false, 0xFACC15, 0, "", true);
     rx += 105.0f;
 
-    // Zoom Controls: [-] [100%] [+] (Requirement 2)
     double z_val = hamshack_web::get_web_maps().get_zoom(hs.active_page_subtab);
     char z_buf[16];
     std::snprintf(z_buf, sizeof(z_buf), "%.0f%%", z_val * 100.0);
@@ -3020,7 +3067,6 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
     draw_hs_btn(r, hs, mouse_pt, rx, t_y + 3.0f, 26, 26, HS_PAGE_ZOOM_IN, "＋", false, 0x38BDF8, 0, "", true);
     rx += 31.0f;
 
-    // Persistent Cookies Indicator & External Safari Button
     D2D1_RECT_F badge = D2D1::RectF(rx, t_y + 3.0f, rx + 145.0f, t_y + 29.0f);
     r.fill_round_rect(badge, 4.0f, r.hex_color(0x10B981, 0.16f));
     r.draw_round_rect(badge, 4.0f, r.hex_color(0x10B981, 0.5f), 1.0f);
@@ -3033,21 +3079,13 @@ inline void render_pages_workspace(RendererT& r, AppT& app, HamShackSuite& hs, P
     draw_hs_btn(r, hs, mouse_pt, rx, t_y + 3.0f, 82, 26, HS_WEB_EXTERNAL, "↗ Safari", false, 0xFBBF24, 0, "", true);
 #endif
 
-    // Synchronize live WebView2 / WKWebView position and visibility
-    float web_top = t_y + 36.0f;
-    float web_h = std::max(100.0f, (y + h) - web_top);
-    hamshack_web::get_web_maps().sync_visibility(ns_view_ptr, hs.active_page_subtab, x, web_top, w, web_h);
-    if (!hamshack_web::get_web_maps().has_native_webview()) {
-        D2D1_RECT_F fb_r = D2D1::RectF(x, web_top, x + w, web_top + web_h);
-        r.fill_round_rect(fb_r, 8.0f, r.hex_color(0x0B111E));
-        r.draw_round_rect(fb_r, 8.0f, r.hex_color(0x1E293B), 1.2f);
-        float cy = web_top + web_h * 0.35f;
-        r.draw_text(kPageTitles[hs.active_page_subtab], r.font_title,
-                    D2D1::RectF(x + 20, cy, x + w - 20, cy + 32), r.hex_color(0x00E5FF), DWRITE_TEXT_ALIGNMENT_CENTER);
-        r.draw_text(live_url, r.font_mono,
-                    D2D1::RectF(x + 20, cy + 36, x + w - 20, cy + 62), r.hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        draw_hs_btn(r, hs, mouse_pt, x + w * 0.5f - 130.0f, cy + 76.0f, 260.0f, 36.0f,
-                    HS_WEB_EXTERNAL, "↗ Open Live Page in Browser", true, 0x10B981, 0, "", true);
+    // 3. Pages Site Tabs Bar at Bottom (just above the main global bottom tab bar)
+    float stw = (w - 16.0f) / 5.0f;
+    for (int i = 0; i < 5; ++i) {
+        bool act = (hs.active_page_subtab == i);
+        uint32_t col = (i == 0) ? 0xF59E0B : 0x00E5FF;
+        draw_hs_btn(r, hs, mouse_pt, x + i * (stw + 4.0f), sites_y, stw, 28.0f,
+                    HS_PAGE_SUBTAB_BASE + i, kPageTitles[i], act, col, i, "", true);
     }
 }
 
@@ -3329,32 +3367,48 @@ template <typename RendererT, typename AppT>
 inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs, POINT mouse_pt,
                                      float x, float y, float w, float h) {
     auto& cfg = hamshack::get_app_config();
+    float wl_pt = std::clamp(hs.winlink_font_size, 9.0f, 26.0f);
+    float sc = wl_pt / 13.0f;
+    auto* wl_ui      = r.get_scaled_ui_font(wl_pt, false);
+    auto* wl_bold    = r.get_scaled_ui_font(wl_pt, true);
+    auto* wl_small   = r.get_scaled_ui_font(std::max(8.5f, wl_pt - 1.5f), false);
+    auto* wl_mono    = r.get_scaled_mono_font(std::max(8.5f, wl_pt - 1.0f));
+    auto* wl_mono_lg = r.get_scaled_mono_font(wl_pt + 0.5f);
+    (void)wl_ui;
 
-    // 1. Top Sub-Tab Bar (Mailbox, Gateways, Configuration)
+    // 1. Top Sub-Tab Bar (Mailbox, Gateways, Configuration + Font Zoom Controls)
     float bar_h = 32.0f;
     D2D1_RECT_F bar_r = D2D1::RectF(x, y, x + w, y + bar_h);
     r.fill_round_rect(bar_r, 6.0f, r.hex_color(0x0A0F1D));
     r.draw_round_rect(bar_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
 
     float bx = x + 6.0f;
+    std::string gw_tab_lbl = "🌐 Gateways (" + std::to_string(hs.winlink.all_gateways.size()) + ")";
     struct WlSubTab {
         int id;
         int idx;
-        const char* label;
+        std::string label;
         uint32_t col;
     };
-    static const WlSubTab kWlTabs[3] = {
-        {HS_WL_SUBTAB_MAILBOX,  0, "📬 Mailbox",           0x34D399},
-        {HS_WL_SUBTAB_GATEWAYS, 1, "🌐 Gateways (4,807)",  0x38BDF8},
-        {HS_WL_SUBTAB_CONFIG,   2, "⚙ Configuration",      0xF59E0B}
+    WlSubTab kWlTabs[3] = {
+        {HS_WL_SUBTAB_MAILBOX,  0, "📬 Mailbox",     0x34D399},
+        {HS_WL_SUBTAB_GATEWAYS, 1, gw_tab_lbl,       0x38BDF8},
+        {HS_WL_SUBTAB_CONFIG,   2, "⚙ Configuration",0xF59E0B}
     };
     for (int i = 0; i < 3; ++i) {
-        float tw = 150.0f;
+        float tw = 156.0f;
         bool sel = (hs.active_winlink_subtab == kWlTabs[i].idx);
         draw_hs_btn(r, hs, mouse_pt, bx, y + 3.0f, tw, 26.0f, kWlTabs[i].id,
                     kWlTabs[i].label, sel, kWlTabs[i].col, kWlTabs[i].idx, "", true);
         bx += tw + 6.0f;
     }
+
+    // Whole-Winlink-Tab Zoom Buttons (also mapped to Cmd+/Cmd- on macOS & Ctrl+/Ctrl- on Windows)
+    char z_lbl[24];
+    std::snprintf(z_lbl, sizeof(z_lbl), "%.0fpt", wl_pt);
+    draw_hs_btn(r, hs, mouse_pt, bx + 4.0f, y + 3.0f, 28.0f, 26.0f, HS_WL_ZOOM_OUT, "－", false, 0x38BDF8, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, bx + 35.0f, y + 3.0f, 52.0f, 26.0f, HS_WL_ZOOM_RESET, z_lbl, false, 0x00E5FF, 0, "", true);
+    draw_hs_btn(r, hs, mouse_pt, bx + 90.0f, y + 3.0f, 28.0f, 26.0f, HS_WL_ZOOM_IN, "＋", false, 0x38BDF8, 0, "", true);
 
     // Top status pill on right of bar
     std::string trans_lbl = (cfg.winlink_transport == 0) ? "Telnet CMS" : (cfg.winlink_transport == 1) ? "ARDOP HF" : "Packet";
@@ -3368,11 +3422,11 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
     float body_h = h - bar_h - 6.0f;
 
     // ------------------------------------------------------------------------
-    // SUBTAB 0: MAILBOX (Email Client + Right Sidebar with Radio/Modem & BIG SEND/RECEIVE)
+    // SUBTAB 0: MAILBOX (Email Client + Resizable Right Sidebar & Session Log)
     // ------------------------------------------------------------------------
     if (hs.active_winlink_subtab == 0) {
-        float sb_w = 320.0f;
-        float main_w = w - sb_w - 8.0f;
+        float sb_w = std::clamp(hs.winlink_sidebar_w, 260.0f, std::min(620.0f, w * 0.52f));
+        float main_w = w - sb_w - 10.0f;
 
         // Left Main Mailbox Area:
         // Top action bar (Folder tabs + Compose + Delete)
@@ -3423,13 +3477,14 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             r.draw_round_rect(list_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
 
             // Table Header Row
-            D2D1_RECT_F hdr_r = D2D1::RectF(x + 2, c_top + 2, x + main_w - 2, c_top + 22.0f);
+            float hdr_h = std::max(22.0f, std::round(22.0f * sc));
+            D2D1_RECT_F hdr_r = D2D1::RectF(x + 2, c_top + 2, x + main_w - 2, c_top + 2 + hdr_h);
             r.fill_round_rect(hdr_r, 4.0f, r.hex_color(0x0F172A));
-            r.draw_text("SENDER / RECIPIENT", r.font_ui_bold, D2D1::RectF(x + 10, c_top + 4, x + 180, c_top + 20), r.hex_color(0x94A3B8));
-            r.draw_text("DATE (UTC)", r.font_ui_bold, D2D1::RectF(x + 185, c_top + 4, x + 340, c_top + 20), r.hex_color(0x94A3B8));
-            r.draw_text("SUBJECT", r.font_ui_bold, D2D1::RectF(x + 345, c_top + 4, x + main_w - 140, c_top + 20), r.hex_color(0x94A3B8));
-            r.draw_text("SIZE", r.font_ui_bold, D2D1::RectF(x + main_w - 135, c_top + 4, x + main_w - 75, c_top + 20), r.hex_color(0x94A3B8));
-            r.draw_text("FILE", r.font_ui_bold, D2D1::RectF(x + main_w - 70, c_top + 4, x + main_w - 10, c_top + 20), r.hex_color(0x94A3B8));
+            r.draw_text("SENDER / RECIPIENT", wl_bold, D2D1::RectF(x + 10, c_top + 3, x + 190, c_top + 2 + hdr_h), r.hex_color(0x94A3B8));
+            r.draw_text("DATE (UTC)", wl_bold, D2D1::RectF(x + 195, c_top + 3, x + 360, c_top + 2 + hdr_h), r.hex_color(0x94A3B8));
+            r.draw_text("SUBJECT", wl_bold, D2D1::RectF(x + 365, c_top + 3, x + main_w - 140, c_top + 2 + hdr_h), r.hex_color(0x94A3B8));
+            r.draw_text("SIZE", wl_bold, D2D1::RectF(x + main_w - 135, c_top + 3, x + main_w - 75, c_top + 2 + hdr_h), r.hex_color(0x94A3B8));
+            r.draw_text("FILE", wl_bold, D2D1::RectF(x + main_w - 70, c_top + 3, x + main_w - 10, c_top + 2 + hdr_h), r.hex_color(0x94A3B8));
 
             // List items from active folder
             const std::vector<winlink::WinlinkMessage>* f_list = &hs.winlink.inbox;
@@ -3437,9 +3492,9 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             else if (hs.winlink.active_folder == 2) f_list = &hs.winlink.sent;
             else if (hs.winlink.active_folder == 3) f_list = &hs.winlink.archive;
 
-            float row_y = c_top + 24.0f;
-            float row_h = 24.0f;
-            int max_rows = static_cast<int>((list_h - 26.0f) / row_h);
+            float row_y = c_top + 4.0f + hdr_h;
+            float row_h = std::max(22.0f, std::round(24.0f * sc));
+            int max_rows = std::max(1, static_cast<int>((list_h - hdr_h - 6.0f) / row_h));
             for (size_t i = 0; i < f_list->size() && static_cast<int>(i) < max_rows; ++i) {
                 const auto& msg = (*f_list)[i];
                 bool is_sel = (static_cast<int>(i) == hs.winlink.selected_msg_idx);
@@ -3451,20 +3506,20 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
                     r.fill_round_rect(row_r, 4.0f, r.hex_color(0x0E1726));
                 }
                 std::string party = (hs.winlink.active_folder == 1 || hs.winlink.active_folder == 2) ? msg.to : msg.from;
-                r.draw_text(party, r.font_mono_small, D2D1::RectF(x + 10, row_y + 4, x + 180, row_y + 20), r.hex_color(is_sel ? 0x38BDF8 : 0xE2E8F0));
-                r.draw_text(msg.date_str.substr(0, std::min<size_t>(msg.date_str.size(), 20)), r.font_mono_small, D2D1::RectF(x + 185, row_y + 4, x + 340, row_y + 20), r.hex_color(0x94A3B8));
-                r.draw_text(msg.subject, r.font_ui_bold, D2D1::RectF(x + 345, row_y + 4, x + main_w - 140, row_y + 20), r.hex_color(is_sel ? 0x00E5FF : 0xF1F5F9));
+                r.draw_text(party, wl_mono, D2D1::RectF(x + 10, row_y + 2, x + 190, row_y + row_h - 2), r.hex_color(is_sel ? 0x38BDF8 : 0xE2E8F0));
+                r.draw_text(msg.date_str.substr(0, std::min<size_t>(msg.date_str.size(), 20)), wl_mono, D2D1::RectF(x + 195, row_y + 2, x + 360, row_y + row_h - 2), r.hex_color(0x94A3B8));
+                r.draw_text(msg.subject, wl_bold, D2D1::RectF(x + 365, row_y + 2, x + main_w - 140, row_y + row_h - 2), r.hex_color(is_sel ? 0x00E5FF : 0xF1F5F9));
                 char sz_buf[32];
                 std::snprintf(sz_buf, sizeof(sz_buf), "%zu B", msg.total_bytes);
-                r.draw_text(sz_buf, r.font_mono_small, D2D1::RectF(x + main_w - 135, row_y + 4, x + main_w - 75, row_y + 20), r.hex_color(0x94A3B8));
+                r.draw_text(sz_buf, wl_mono, D2D1::RectF(x + main_w - 135, row_y + 2, x + main_w - 75, row_y + row_h - 2), r.hex_color(0x94A3B8));
                 if (!msg.attachments.empty()) {
-                    r.draw_text("📎 " + std::to_string(msg.attachments.size()), r.font_mono_small, D2D1::RectF(x + main_w - 70, row_y + 4, x + main_w - 10, row_y + 20), r.hex_color(0xF59E0B));
+                    r.draw_text("📎 " + std::to_string(msg.attachments.size()), wl_mono, D2D1::RectF(x + main_w - 70, row_y + 2, x + main_w - 10, row_y + row_h - 2), r.hex_color(0xF59E0B));
                 }
                 hs.add_hit(row_r, HS_WL_MSG_ROW_BASE + static_cast<int>(i), static_cast<int>(i));
                 row_y += row_h;
             }
             if (f_list->empty()) {
-                r.draw_text("(Folder is empty)", r.font_mono_small, D2D1::RectF(x + 10, c_top + 35, x + main_w - 10, c_top + 60), r.hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
+                r.draw_text("(Folder is empty)", wl_mono, D2D1::RectF(x + 10, c_top + 35, x + main_w - 10, c_top + 65), r.hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
             }
 
             // Message Preview Pane
@@ -3475,38 +3530,37 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             if (!f_list->empty() && hs.winlink.selected_msg_idx >= 0 && hs.winlink.selected_msg_idx < static_cast<int>(f_list->size())) {
                 const auto& msg = (*f_list)[hs.winlink.selected_msg_idx];
                 float py = prev_y + 8.0f;
-                r.draw_text("FROM:    " + msg.from, r.font_mono_small, D2D1::RectF(x + 12, py, x + main_w - 12, py + 16), r.hex_color(0x38BDF8));
-                py += 18.0f;
-                r.draw_text("TO:      " + msg.to + (msg.cc.empty() ? "" : "  (CC: " + msg.cc + ")"), r.font_mono_small, D2D1::RectF(x + 12, py, x + main_w - 12, py + 16), r.hex_color(0xCBD5E1));
-                py += 18.0f;
-                r.draw_text("DATE:    " + msg.date_str + "    MID: " + msg.mid, r.font_mono_small, D2D1::RectF(x + 12, py, x + main_w - 12, py + 16), r.hex_color(0x94A3B8));
-                py += 18.0f;
-                r.draw_text("SUBJECT: " + msg.subject, r.font_ui_bold, D2D1::RectF(x + 12, py, x + main_w - 12, py + 18), r.hex_color(0x00E5FF));
-                py += 22.0f;
+                float meta_lh = std::max(17.0f, std::round(18.0f * sc));
+                r.draw_text("FROM:    " + msg.from, wl_mono, D2D1::RectF(x + 12, py, x + main_w - 12, py + meta_lh), r.hex_color(0x38BDF8));
+                py += meta_lh;
+                r.draw_text("TO:      " + msg.to + (msg.cc.empty() ? "" : "  (CC: " + msg.cc + ")"), wl_mono, D2D1::RectF(x + 12, py, x + main_w - 12, py + meta_lh), r.hex_color(0xCBD5E1));
+                py += meta_lh;
+                r.draw_text("DATE:    " + msg.date_str + "    MID: " + msg.mid, wl_mono, D2D1::RectF(x + 12, py, x + main_w - 12, py + meta_lh), r.hex_color(0x94A3B8));
+                py += meta_lh;
+                r.draw_text("SUBJECT: " + msg.subject, wl_bold, D2D1::RectF(x + 12, py, x + main_w - 12, py + meta_lh + 2), r.hex_color(0x00E5FF));
+                py += meta_lh + 6.0f;
 
                 if (!msg.attachments.empty()) {
                     float att_x = x + 12.0f;
                     for (const auto& a : msg.attachments) {
                         std::string a_lbl = "📎 " + a.filename + " (" + std::to_string(a.size_bytes / 1024) + " KB)";
-                        float aw = 20.0f + static_cast<float>(a_lbl.size() * 7.5f);
-                        D2D1_RECT_F ar = D2D1::RectF(att_x, py, att_x + aw, py + 22.0f);
+                        float aw = 20.0f + static_cast<float>(a_lbl.size() * 7.5f * sc);
+                        D2D1_RECT_F ar = D2D1::RectF(att_x, py, att_x + aw, py + 24.0f * sc);
                         r.fill_round_rect(ar, 4.0f, r.hex_color(0x1E293B));
                         r.draw_round_rect(ar, 4.0f, r.hex_color(0xF59E0B), 1.0f);
-                        r.draw_text(a_lbl, r.font_mono_small, ar, r.hex_color(0xF59E0B), DWRITE_TEXT_ALIGNMENT_CENTER);
+                        r.draw_text(a_lbl, wl_mono, ar, r.hex_color(0xF59E0B), DWRITE_TEXT_ALIGNMENT_CENTER);
                         att_x += aw + 6.0f;
                     }
-                    py += 28.0f;
+                    py += 28.0f * sc;
                 }
 
-                // Separator line
                 r.fill_round_rect(D2D1::RectF(x + 10, py, x + main_w - 10, py + 1.0f), 0.0f, r.hex_color(0x334155));
                 py += 8.0f;
 
-                // Message Body
                 D2D1_RECT_F body_box = D2D1::RectF(x + 12, py, x + main_w - 12, prev_y + prev_h - 8.0f);
-                r.draw_text(msg.body, r.font_mono_small, body_box, r.hex_color(0xF8FAFC));
+                r.draw_text(msg.body, wl_mono, body_box, r.hex_color(0xF8FAFC));
             } else {
-                r.draw_text("Select a message to preview", r.font_mono_small, prev_r, r.hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
+                r.draw_text("Select a message to preview", wl_mono, prev_r, r.hex_color(0x64748B), DWRITE_TEXT_ALIGNMENT_CENTER);
             }
         } else {
             // Composer Mode
@@ -3515,74 +3569,76 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             r.draw_round_rect(comp_r, 6.0f, r.hex_color(0x00E5FF), 1.0f);
 
             float cy = c_top + 10.0f;
-            r.draw_text("COMPOSE WINLINK MESSAGE (B2F v3.2 PROTOCOL)", r.font_ui_bold,
-                        D2D1::RectF(x + 14, cy, x + main_w - 14, cy + 20), r.hex_color(0x00E5FF));
-            cy += 26.0f;
+            float f_h = std::max(26.0f, std::round(26.0f * sc));
+            float lbl_x2 = x + std::max(72.0f, 68.0f * sc);
+            r.draw_text("COMPOSE WINLINK MESSAGE (B2F v3.2 PROTOCOL)", wl_bold,
+                        D2D1::RectF(x + 14, cy, x + main_w - 14, cy + 22 * sc), r.hex_color(0x00E5FF));
+            cy += std::max(26.0f, 26.0f * sc);
 
             // To: Field
-            r.draw_text("To:", r.font_ui_bold, D2D1::RectF(x + 14, cy + 4, x + 70, cy + 24), r.hex_color(0x94A3B8));
-            D2D1_RECT_F to_box = D2D1::RectF(x + 75, cy, x + main_w - 14, cy + 26.0f);
+            r.draw_text("To:", wl_bold, D2D1::RectF(x + 14, cy + 3, lbl_x2, cy + f_h), r.hex_color(0x94A3B8));
+            D2D1_RECT_F to_box = D2D1::RectF(lbl_x2 + 4, cy, x + main_w - 14, cy + f_h);
             bool to_foc = (hs.text_focus == HsTextFocus::WlCompTo);
             r.fill_round_rect(to_box, 4.0f, r.hex_color(0x0F172A));
             r.draw_round_rect(to_box, 4.0f, to_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
             std::string to_disp = hs.winlink.compose_to + (to_foc ? "_" : "");
             if (to_disp.empty() && !to_foc) to_disp = "Callsign or email (e.g. W1AW or operator@winlink.org)";
-            r.draw_text(to_disp, r.font_mono_small, D2D1::RectF(to_box.left + 8, to_box.top + 5, to_box.right - 8, to_box.bottom),
+            r.draw_text(to_disp, wl_mono, D2D1::RectF(to_box.left + 8, to_box.top + 4, to_box.right - 8, to_box.bottom),
                         to_foc || !hs.winlink.compose_to.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
             hs.add_hit(to_box, HS_WL_COMP_TO_BOX);
-            cy += 32.0f;
+            cy += f_h + 6.0f;
 
             // Cc: Field
-            r.draw_text("Cc:", r.font_ui_bold, D2D1::RectF(x + 14, cy + 4, x + 70, cy + 24), r.hex_color(0x94A3B8));
-            D2D1_RECT_F cc_box = D2D1::RectF(x + 75, cy, x + main_w - 14, cy + 26.0f);
+            r.draw_text("Cc:", wl_bold, D2D1::RectF(x + 14, cy + 3, lbl_x2, cy + f_h), r.hex_color(0x94A3B8));
+            D2D1_RECT_F cc_box = D2D1::RectF(lbl_x2 + 4, cy, x + main_w - 14, cy + f_h);
             bool cc_foc = (hs.text_focus == HsTextFocus::WlCompCc);
             r.fill_round_rect(cc_box, 4.0f, r.hex_color(0x0F172A));
             r.draw_round_rect(cc_box, 4.0f, cc_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
             std::string cc_disp = hs.winlink.compose_cc + (cc_foc ? "_" : "");
-            r.draw_text(cc_disp, r.font_mono_small, D2D1::RectF(cc_box.left + 8, cc_box.top + 5, cc_box.right - 8, cc_box.bottom),
+            r.draw_text(cc_disp, wl_mono, D2D1::RectF(cc_box.left + 8, cc_box.top + 4, cc_box.right - 8, cc_box.bottom),
                         cc_foc || !hs.winlink.compose_cc.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
             hs.add_hit(cc_box, HS_WL_COMP_CC_BOX);
-            cy += 32.0f;
+            cy += f_h + 6.0f;
 
             // Subject: Field
-            r.draw_text("Subject:", r.font_ui_bold, D2D1::RectF(x + 14, cy + 4, x + 70, cy + 24), r.hex_color(0x94A3B8));
-            D2D1_RECT_F subj_box = D2D1::RectF(x + 75, cy, x + main_w - 14, cy + 26.0f);
+            r.draw_text("Subject:", wl_bold, D2D1::RectF(x + 14, cy + 3, lbl_x2, cy + f_h), r.hex_color(0x94A3B8));
+            D2D1_RECT_F subj_box = D2D1::RectF(lbl_x2 + 4, cy, x + main_w - 14, cy + f_h);
             bool subj_foc = (hs.text_focus == HsTextFocus::WlCompSubj);
             r.fill_round_rect(subj_box, 4.0f, r.hex_color(0x0F172A));
             r.draw_round_rect(subj_box, 4.0f, subj_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
             std::string subj_disp = hs.winlink.compose_subject + (subj_foc ? "_" : "");
-            r.draw_text(subj_disp, r.font_mono_small, D2D1::RectF(subj_box.left + 8, subj_box.top + 5, subj_box.right - 8, subj_box.bottom),
+            r.draw_text(subj_disp, wl_mono, D2D1::RectF(subj_box.left + 8, subj_box.top + 4, subj_box.right - 8, subj_box.bottom),
                         subj_foc || !hs.winlink.compose_subject.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
             hs.add_hit(subj_box, HS_WL_COMP_SUBJ_BOX);
-            cy += 32.0f;
+            cy += f_h + 6.0f;
 
             // Attachments Row
-            draw_hs_btn(r, hs, mouse_pt, x + 75, cy, 150.0f, 26.0f, HS_WL_ATTACH_ADD_BTN, "📎 Add Attachment...", false, 0xF59E0B, 0, "", true);
-            float ax = x + 232.0f;
+            draw_hs_btn(r, hs, mouse_pt, lbl_x2 + 4, cy, 150.0f, 26.0f, HS_WL_ATTACH_ADD_BTN, "📎 Add Attachment...", false, 0xF59E0B, 0, "", true);
+            float ax = lbl_x2 + 160.0f;
             if (!hs.winlink.compose_attachments.empty()) {
                 draw_hs_btn(r, hs, mouse_pt, ax, cy, 75.0f, 26.0f, HS_WL_ATTACH_CLR_BTN, "Clear", false, 0xEF4444, 0, "", true);
                 ax += 82.0f;
                 for (const auto& att : hs.winlink.compose_attachments) {
                     std::string att_chip = "📄 " + att.filename + " (" + std::to_string(att.size_bytes / 1024) + " KB)";
-                    float cw = 16.0f + static_cast<float>(att_chip.size() * 7.5f);
+                    float cw = 16.0f + static_cast<float>(att_chip.size() * 7.5f * sc);
                     D2D1_RECT_F cr = D2D1::RectF(ax, cy, ax + cw, cy + 26.0f);
                     r.fill_round_rect(cr, 4.0f, r.hex_color(0x1E293B));
                     r.draw_round_rect(cr, 4.0f, r.hex_color(0x10B981), 1.0f);
-                    r.draw_text(att_chip, r.font_mono_small, cr, r.hex_color(0x34D399), DWRITE_TEXT_ALIGNMENT_CENTER);
+                    r.draw_text(att_chip, wl_mono, cr, r.hex_color(0x34D399), DWRITE_TEXT_ALIGNMENT_CENTER);
                     ax += cw + 4.0f;
                 }
             }
             cy += 32.0f;
 
             // Body Area
-            float body_box_h = (c_top + c_h) - cy - 44.0f;
+            float body_box_h = std::max(60.0f, (c_top + c_h) - cy - 44.0f);
             D2D1_RECT_F body_box = D2D1::RectF(x + 14, cy, x + main_w - 14, cy + body_box_h);
             bool body_foc = (hs.text_focus == HsTextFocus::WlCompBody);
             r.fill_round_rect(body_box, 4.0f, r.hex_color(0x0F172A));
             r.draw_round_rect(body_box, 4.0f, body_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
             std::string b_disp = hs.winlink.compose_body + (body_foc ? "_" : "");
             if (b_disp.empty() && !body_foc) b_disp = "Compose email message body here...";
-            r.draw_text(b_disp, r.font_mono_small, D2D1::RectF(body_box.left + 8, body_box.top + 8, body_box.right - 8, body_box.bottom - 8),
+            r.draw_text(b_disp, wl_mono, D2D1::RectF(body_box.left + 8, body_box.top + 8, body_box.right - 8, body_box.bottom - 8),
                         body_foc || !hs.winlink.compose_body.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
             hs.add_hit(body_box, HS_WL_COMP_BODY_BOX);
             cy += body_box_h + 8.0f;
@@ -3593,52 +3649,74 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         }
 
         // ====================================================================
-        // RIGHT SIDEBAR: Radio Status + Modem Info + Gateway + BIG BUTTON!
+        // RIGHT SIDEBAR: Resizable Width + Resizable SESSION LOG (B2F) Box!
         // ====================================================================
-        float rx = x + main_w + 8.0f;
+        D2D1_RECT_F split_v = D2D1::RectF(x + main_w + 1.0f, body_y, x + main_w + 9.0f, body_y + body_h);
+        bool split_v_hov = RendererT::pt_in_rect(mouse_pt, split_v) || hs.dragging_wl_sidebar;
+        r.fill_round_rect(D2D1::RectF(x + main_w + 4.0f, body_y + 12.0f, x + main_w + 6.0f, body_y + body_h - 12.0f),
+                          1.0f, split_v_hov ? r.hex_color(0x00E5FF) : r.hex_color(0x1E293B));
+        hs.add_hit(split_v, HS_WL_SIDEBAR_SPLIT);
+
+        float rx = x + main_w + 10.0f;
         D2D1_RECT_F sb_r = D2D1::RectF(rx, body_y, rx + sb_w, body_y + body_h);
         r.fill_round_rect(sb_r, 6.0f, r.hex_color(0x0F172A));
         r.draw_round_rect(sb_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
 
         float sy = body_y + 8.0f;
+        float extra_log_h = std::clamp(hs.winlink_log_extra_h, 0.0f, 280.0f);
 
-        // 1. Radio Status Card (FLRig CAT Xiegu G90)
-        D2D1_RECT_F card1 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 74.0f);
-        r.fill_round_rect(card1, 5.0f, r.hex_color(0x05080F));
-        r.draw_round_rect(card1, 5.0f, r.hex_color(0x334155), 1.0f);
-        r.draw_text("RADIO STATUS (XIEGU G90 CAT)", r.font_ui_bold, D2D1::RectF(card1.left + 8, card1.top + 6, card1.right - 8, card1.top + 22), r.hex_color(0x00E5FF));
-        std::string rig_f = hamshack::FlrigCatEngine::format_freq_mhz(hs.flrig.vfo_a_hz) + " MHz " + hamshack::FlrigCatEngine::mode_name(hs.flrig.mode_a);
-        r.draw_text(rig_f, r.font_mono, D2D1::RectF(card1.left + 8, card1.top + 26, card1.right - 8, card1.top + 46), hs.flrig.connected ? r.hex_color(0x10B981) : r.hex_color(0xEF4444));
-        std::string rig_meta = std::string(hs.flrig.connected ? "● CAT ONLINE" : "○ CAT OFFLINE") + " • PTT: " + (hs.flrig.ptt_active ? "TX" : "RX") + " • " + std::to_string(hs.flrig.power_watts) + "W";
-        r.draw_text(rig_meta, r.font_mono_small, D2D1::RectF(card1.left + 8, card1.top + 50, card1.right - 8, card1.top + 68), r.hex_color(0x94A3B8));
-        sy += 80.0f;
+        // Smoothly compact or collapse the 3 upper status cards as the user drags SESSION LOG taller!
+        if (extra_log_h < 180.0f) {
+            bool compact_cards = (extra_log_h >= 60.0f);
+            float card_h = compact_cards ? 44.0f : 74.0f;
 
-        // 2. Modem & Transport Card
-        D2D1_RECT_F card2 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 74.0f);
-        r.fill_round_rect(card2, 5.0f, r.hex_color(0x05080F));
-        r.draw_round_rect(card2, 5.0f, r.hex_color(0x334155), 1.0f);
-        r.draw_text("MODEM & TRANSPORT", r.font_ui_bold, D2D1::RectF(card2.left + 8, card2.top + 6, card2.right - 8, card2.top + 22), r.hex_color(0x38BDF8));
-        std::string trans_full = (cfg.winlink_transport == 0) ? "Telnet CMS Direct Socket" : (cfg.winlink_transport == 1) ? "ARDOP HF Soundcard TNC" : "Packet AX.25 TNC";
-        r.draw_text(trans_full, r.font_mono_small, D2D1::RectF(card2.left + 8, card2.top + 26, card2.right - 8, card2.top + 44), r.hex_color(0x34D399));
-        std::string mod_meta = (cfg.winlink_transport == 0)
-            ? ("Host: " + cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) + " (" + cfg.winlink_cms_call + ")")
-            : (hs.winlink.ardop_modem.is_running()
-                ? "ARDOP: ● ONLINE (127.0.0.1:8515)"
-                : "ARDOP: ○ STANDBY (Auto-starts on TX)");
-        r.draw_text(mod_meta, r.font_mono_small, D2D1::RectF(card2.left + 8, card2.top + 48, card2.right - 8, card2.top + 66),
-                    hs.winlink.ardop_modem.is_running() ? r.hex_color(0x10B981) : r.hex_color(0x94A3B8));
-        sy += 80.0f;
+            // 1. Radio Status Card
+            D2D1_RECT_F card1 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + card_h);
+            r.fill_round_rect(card1, 5.0f, r.hex_color(0x05080F));
+            r.draw_round_rect(card1, 5.0f, r.hex_color(0x334155), 1.0f);
+            r.draw_text("RADIO STATUS (XIEGU G90 CAT)", wl_bold, D2D1::RectF(card1.left + 8, card1.top + 4, card1.right - 8, card1.top + 22), r.hex_color(0x00E5FF));
+            std::string rig_f = hamshack::FlrigCatEngine::format_freq_mhz(hs.flrig.vfo_a_hz) + " MHz " + hamshack::FlrigCatEngine::mode_name(hs.flrig.mode_a);
+            r.draw_text(rig_f, compact_cards ? wl_mono : wl_mono_lg, D2D1::RectF(card1.left + 8, card1.top + (compact_cards ? 22 : 25), card1.right - 8, card1.top + (compact_cards ? 42 : 46)),
+                        hs.flrig.connected ? r.hex_color(0x10B981) : r.hex_color(0xEF4444));
+            if (!compact_cards) {
+                std::string rig_meta = std::string(hs.flrig.connected ? "● CAT ONLINE" : "○ CAT OFFLINE") + " • PTT: " + (hs.flrig.ptt_active ? "TX" : "RX") + " • " + std::to_string(hs.flrig.power_watts) + "W";
+                r.draw_text(rig_meta, wl_mono, D2D1::RectF(card1.left + 8, card1.top + 49, card1.right - 8, card1.top + 69), r.hex_color(0x94A3B8));
+            }
+            sy += card_h + 6.0f;
 
-        // 3. Selected Target Gateway Card
-        D2D1_RECT_F card3 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 74.0f);
-        r.fill_round_rect(card3, 5.0f, r.hex_color(0x05080F));
-        r.draw_round_rect(card3, 5.0f, r.hex_color(0x334155), 1.0f);
-        r.draw_text("TARGET RMS GATEWAY", r.font_ui_bold, D2D1::RectF(card3.left + 8, card3.top + 6, card3.right - 8, card3.top + 22), r.hex_color(0xF59E0B));
-        std::string gw_line = hs.winlink.selected_gateway_call.empty() ? "(Click Gateways tab to pick)" : (hs.winlink.selected_gateway_call + " • " + hs.winlink.selected_gateway_mode);
-        r.draw_text(gw_line, r.font_mono, D2D1::RectF(card3.left + 8, card3.top + 26, card3.right - 8, card3.top + 46), r.hex_color(0xFBBF24));
-        std::string gw_meta = (hs.winlink.selected_gateway_freq > 0) ? ("Dial: " + hamshack::FlrigCatEngine::format_freq_mhz(hs.winlink.selected_gateway_freq) + " MHz USB • " + hs.winlink.selected_gateway_grid) : "Worldwide CMS Node";
-        r.draw_text(gw_meta, r.font_mono_small, D2D1::RectF(card3.left + 8, card3.top + 50, card3.right - 8, card3.top + 68), r.hex_color(0x94A3B8));
-        sy += 80.0f;
+            // 2. Modem & Transport Card
+            D2D1_RECT_F card2 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + card_h);
+            r.fill_round_rect(card2, 5.0f, r.hex_color(0x05080F));
+            r.draw_round_rect(card2, 5.0f, r.hex_color(0x334155), 1.0f);
+            r.draw_text("MODEM & TRANSPORT", wl_bold, D2D1::RectF(card2.left + 8, card2.top + 4, card2.right - 8, card2.top + 22), r.hex_color(0x38BDF8));
+            std::string mod_meta = (cfg.winlink_transport == 0)
+                ? ("CMS: " + cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) + " (" + cfg.winlink_cms_call + ")")
+                : (hs.winlink.ardop_modem.is_running() ? "ARDOP: ● ONLINE (127.0.0.1:8515)" : "ARDOP: ○ STANDBY");
+            if (compact_cards) {
+                r.draw_text(mod_meta, wl_mono, D2D1::RectF(card2.left + 8, card2.top + 22, card2.right - 8, card2.top + 42), r.hex_color(0x34D399));
+            } else {
+                std::string trans_full = (cfg.winlink_transport == 0) ? "Telnet CMS Direct Socket" : (cfg.winlink_transport == 1) ? "ARDOP HF Soundcard TNC" : "Packet AX.25 TNC";
+                r.draw_text(trans_full, wl_mono, D2D1::RectF(card2.left + 8, card2.top + 25, card2.right - 8, card2.top + 44), r.hex_color(0x34D399));
+                r.draw_text(mod_meta, wl_mono, D2D1::RectF(card2.left + 8, card2.top + 48, card2.right - 8, card2.top + 68),
+                            hs.winlink.ardop_modem.is_running() ? r.hex_color(0x10B981) : r.hex_color(0x94A3B8));
+            }
+            sy += card_h + 6.0f;
+
+            // 3. Selected Target Gateway Card
+            if (extra_log_h < 125.0f) {
+                D2D1_RECT_F card3 = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + card_h);
+                r.fill_round_rect(card3, 5.0f, r.hex_color(0x05080F));
+                r.draw_round_rect(card3, 5.0f, r.hex_color(0x334155), 1.0f);
+                r.draw_text("TARGET RMS GATEWAY", wl_bold, D2D1::RectF(card3.left + 8, card3.top + 4, card3.right - 8, card3.top + 22), r.hex_color(0xF59E0B));
+                std::string gw_line = hs.winlink.selected_gateway_call.empty() ? "(Click Gateways tab to pick)" : (hs.winlink.selected_gateway_call + " • " + hs.winlink.selected_gateway_mode);
+                r.draw_text(gw_line, compact_cards ? wl_mono : wl_mono_lg, D2D1::RectF(card3.left + 8, card3.top + (compact_cards ? 22 : 25), card3.right - 8, card3.top + (compact_cards ? 42 : 46)), r.hex_color(0xFBBF24));
+                if (!compact_cards) {
+                    std::string gw_meta = (hs.winlink.selected_gateway_freq > 0) ? ("Dial: " + hamshack::FlrigCatEngine::format_freq_mhz(hs.winlink.selected_gateway_freq) + " MHz USB • " + hs.winlink.selected_gateway_grid) : "Worldwide CMS Node";
+                    r.draw_text(gw_meta, wl_mono, D2D1::RectF(card3.left + 8, card3.top + 49, card3.right - 8, card3.top + 69), r.hex_color(0x94A3B8));
+                }
+                sy += card_h + 6.0f;
+            }
+        }
 
         // 4. Quick Account Credentials & Sign In Status Pill
         D2D1_RECT_F cred_card = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 30.0f);
@@ -3646,61 +3724,73 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         r.draw_round_rect(cred_card, 4.0f, r.hex_color(0x334155), 1.0f);
         std::string pass_display = cfg.winlink_password.empty() ? "(No Password)" : "••••••••";
         std::string cred_txt = "🔑 " + cfg.winlink_callsign + " • " + pass_display;
-        r.draw_text(cred_txt, r.font_mono_small, D2D1::RectF(cred_card.left + 8, cred_card.top + 6, cred_card.right - 90, cred_card.bottom), r.hex_color(0x38BDF8));
+        r.draw_text(cred_txt, wl_mono, D2D1::RectF(cred_card.left + 8, cred_card.top + 5, cred_card.right - 90, cred_card.bottom), r.hex_color(0x38BDF8));
         draw_hs_btn(r, hs, mouse_pt, cred_card.right - 88.0f, cred_card.top + 2.0f, 84.0f, 26.0f, HS_WL_SUBTAB_CONFIG,
                     "⚙ Sign In", false, 0xF59E0B, 2, "", true);
-        sy += 36.0f;
+        sy += 35.0f;
 
         // 5. THE BIG SEND & RECEIVE BUTTONS (WEB & RADIO!)
         if (hs.winlink.session_active) {
-            float big_btn_h = 42.0f;
+            float big_btn_h = 40.0f;
             draw_hs_btn(r, hs, mouse_pt, rx + 6, sy, sb_w - 12.0f, big_btn_h, HS_WL_ABORT_SESSION,
                         "■ ABORT ACTIVE SESSION", true, 0xEF4444, 0, "", true);
-            sy += big_btn_h + 8.0f;
+            sy += big_btn_h + 6.0f;
         } else {
             float btn_w = sb_w - 12.0f;
-            float btn_h = 34.0f;
+            float btn_h = 32.0f;
             draw_hs_btn(r, hs, mouse_pt, rx + 6, sy, btn_w, btn_h, HS_WL_EXEC_WEB,
                         "🌐 SEND & RECEIVE VIA WEB", false, 0x10B981, 0, "", true);
-            sy += btn_h + 6.0f;
+            sy += btn_h + 5.0f;
 
             draw_hs_btn(r, hs, mouse_pt, rx + 6, sy, btn_w, btn_h, HS_WL_EXEC_RADIO,
                         "📻 SEND & RECEIVE VIA RADIO", false, 0x00E5FF, 1, "", true);
-            sy += btn_h + 8.0f;
+            sy += btn_h + 6.0f;
         }
 
         // Session status banner
         D2D1_RECT_F st_box = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 24.0f);
         r.fill_round_rect(st_box, 4.0f, r.hex_color(0x05080F));
-        r.draw_text(hs.winlink.session_status, r.font_mono_small, st_box,
+        r.draw_text(hs.winlink.session_status, wl_mono, st_box,
                     hs.winlink.session_active ? r.hex_color(0x38BDF8) : r.hex_color(0x94A3B8), DWRITE_TEXT_ALIGNMENT_CENTER);
-        sy += 28.0f;
+        sy += 26.0f;
 
-        // 5. Live B2F Protocol Session Transcript
+        // Horizontal Resize Handle right above SESSION LOG (B2F)
+        D2D1_RECT_F split_h = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + 8.0f);
+        bool split_h_hov = RendererT::pt_in_rect(mouse_pt, split_h) || hs.dragging_wl_log;
+        r.fill_round_rect(D2D1::RectF(rx + sb_w * 0.35f, sy + 3.0f, rx + sb_w * 0.65f, sy + 5.0f),
+                          1.0f, split_h_hov ? r.hex_color(0x00E5FF) : r.hex_color(0x334155));
+        hs.add_hit(split_h, HS_WL_LOG_SPLIT);
+        sy += 9.0f;
+
+        // 6. Live B2F Protocol Session Transcript (Resizable!)
         float log_h = (body_y + body_h) - sy - 8.0f;
         if (log_h > 60.0f) {
             D2D1_RECT_F log_box = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + log_h);
             r.fill_round_rect(log_box, 5.0f, r.hex_color(0x05080F));
             r.draw_round_rect(log_box, 5.0f, r.hex_color(0x1E293B), 1.0f);
-            r.draw_text("SESSION LOG (B2F)", r.font_ui_bold,
-                        D2D1::RectF(log_box.left + 8, log_box.top + 5, log_box.right - 102, log_box.top + 23),
+            r.draw_text("SESSION LOG (B2F)", wl_bold,
+                        D2D1::RectF(log_box.left + 8, log_box.top + 4, log_box.right - 152, log_box.top + 24),
                         r.hex_color(0x64748B));
+            draw_hs_btn(r, hs, mouse_pt, log_box.right - 148.0f, log_box.top + 3.0f, 22.0f, 20.0f,
+                        HS_WL_LOG_TALLER, "▲", false, 0x38BDF8, 0, "", true);
+            draw_hs_btn(r, hs, mouse_pt, log_box.right - 123.0f, log_box.top + 3.0f, 22.0f, 20.0f,
+                        HS_WL_LOG_SHORTER, "▼", false, 0x38BDF8, 0, "", true);
             draw_hs_btn(r, hs, mouse_pt, log_box.right - 98.0f, log_box.top + 3.0f, 92.0f, 20.0f,
                         HS_WL_CLEAR_SESSION, "Clear Session", false, 0x94A3B8, 0, "", true);
 
             std::lock_guard<std::recursive_mutex> lk(hs.winlink.mtx);
             float ly = log_box.top + 26.0f;
-            float lh = 16.0f;
+            float lh = std::max(15.0f, std::round(16.0f * sc));
             int max_lines = std::max(1, static_cast<int>((log_h - 30.0f) / lh));
             int start_idx = std::max(0, static_cast<int>(hs.winlink.session_transcript.size()) - max_lines);
             for (size_t i = start_idx; i < hs.winlink.session_transcript.size(); ++i) {
                 const auto& line = hs.winlink.session_transcript[i];
                 uint32_t col = 0xCBD5E1;
-                if (line.find("ERROR") != std::string::npos || line.find("Failed") != std::string::npos) col = 0xEF4444;
+                if (line.find("ERROR") != std::string::npos || line.find("Failed") != std::string::npos || line.find("failed") != std::string::npos) col = 0xEF4444;
                 else if (line.find("SUCCESS") != std::string::npos || line.find("Complete") != std::string::npos) col = 0x10B981;
-                else if (line.find(">>>") != std::string::npos) col = 0x38BDF8;
-                else if (line.find("<<<") != std::string::npos) col = 0xF59E0B;
-                r.draw_text(line, r.font_mono_small, D2D1::RectF(log_box.left + 8, ly, log_box.right - 8, ly + lh), r.hex_color(col));
+                else if (line.find("> ") != std::string::npos || line.find(">>>") != std::string::npos) col = 0x38BDF8;
+                else if (line.find("< ") != std::string::npos || line.find("<<<") != std::string::npos) col = 0xF59E0B;
+                r.draw_text(line, wl_mono, D2D1::RectF(log_box.left + 8, ly, log_box.right - 8, ly + lh), r.hex_color(col));
                 ly += lh;
             }
         }
@@ -3738,16 +3828,25 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         };
         for (int i = 0; i < 5; ++i) {
             bool sel_m = (hs.winlink.gateway_mode_filter == m_btns[i].mode);
-            float mw = 85.0f;
+            float mw = 82.0f;
             draw_hs_btn(r, hs, mouse_pt, mx, body_y + 5.0f, mw, 26.0f, m_btns[i].id,
                         m_btns[i].label, sel_m, sel_m ? 0x00E5FF : 0x64748B, i, "", true);
             mx += mw + 4.0f;
         }
 
-        // Count Banner
-        std::string cnt_str = "Showing " + std::to_string(hs.winlink.filtered_gateways.size()) + " of " +
-                              std::to_string(hs.winlink.all_gateways.size()) + " Channels (Sorted by Distance from " + cfg.winlink_grid + ")";
-        r.draw_text(cnt_str, r.font_mono_small, D2D1::RectF(mx + 10, body_y + 8, x + w - 10, body_y + 28), r.hex_color(0x10B981));
+        // Live Refresh Gateways Button (fetches fresh RMS gateways from api.winlink.org)
+        bool refreshing = hs.winlink.gateway_refresh_active.load(std::memory_order_relaxed);
+        draw_hs_btn(r, hs, mouse_pt, mx + 4.0f, body_y + 5.0f, 148.0f, 26.0f, HS_WL_GW_REFRESH_BTN,
+                    refreshing ? "⏳ Refreshing..." : "🔄 Refresh Gateways", refreshing, 0x10B981, 0, "", true);
+        mx += 158.0f;
+
+        // Count & Refresh Status Banner
+        std::string cnt_str = hs.winlink.gateway_refresh_status.empty()
+            ? ("Showing " + std::to_string(hs.winlink.filtered_gateways.size()) + " of " +
+               std::to_string(hs.winlink.all_gateways.size()) + " (" + cfg.winlink_grid + ")")
+            : (std::to_string(hs.winlink.filtered_gateways.size()) + "/" +
+               std::to_string(hs.winlink.all_gateways.size()) + " • " + hs.winlink.gateway_refresh_status);
+        r.draw_text(cnt_str, wl_mono, D2D1::RectF(mx + 4, body_y + 8, x + w - 10, body_y + 28), r.hex_color(0x10B981));
 
         // Spreadsheet Table
         float tbl_y = body_y + 42.0f;
@@ -3757,37 +3856,36 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         r.draw_round_rect(tbl_r, 6.0f, r.hex_color(0x1E293B), 1.0f);
 
         // Header Row
-        D2D1_RECT_F thdr = D2D1::RectF(x + 2, tbl_y + 2, x + w - 2, tbl_y + 24.0f);
+        float th_h = std::max(22.0f, std::round(23.0f * sc));
+        D2D1_RECT_F thdr = D2D1::RectF(x + 2, tbl_y + 2, x + w - 2, tbl_y + 2 + th_h);
         r.fill_round_rect(thdr, 4.0f, r.hex_color(0x0F172A));
-        r.draw_text("CALLSIGN", r.font_ui_bold, D2D1::RectF(x + 12, tbl_y + 4, x + 120, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("DIAL FREQ", r.font_ui_bold, D2D1::RectF(x + 125, tbl_y + 4, x + 235, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("MODE", r.font_ui_bold, D2D1::RectF(x + 240, tbl_y + 4, x + 380, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("GRID", r.font_ui_bold, D2D1::RectF(x + 385, tbl_y + 4, x + 465, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("DISTANCE", r.font_ui_bold, D2D1::RectF(x + 470, tbl_y + 4, x + 560, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("AZIMUTH", r.font_ui_bold, D2D1::RectF(x + 565, tbl_y + 4, x + 645, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("HOURS", r.font_ui_bold, D2D1::RectF(x + 650, tbl_y + 4, x + 760, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("SERVICE", r.font_ui_bold, D2D1::RectF(x + 765, tbl_y + 4, x + 860, tbl_y + 22), r.hex_color(0x94A3B8));
-        r.draw_text("RIG QSY ACTION", r.font_ui_bold, D2D1::RectF(x + 865, tbl_y + 4, x + w - 12, tbl_y + 22), r.hex_color(0x00E5FF));
+        r.draw_text("CALLSIGN", wl_bold, D2D1::RectF(x + 12, tbl_y + 3, x + 125, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("DIAL FREQ", wl_bold, D2D1::RectF(x + 130, tbl_y + 3, x + 245, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("MODE", wl_bold, D2D1::RectF(x + 250, tbl_y + 3, x + 390, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("GRID", wl_bold, D2D1::RectF(x + 395, tbl_y + 3, x + 475, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("DISTANCE", wl_bold, D2D1::RectF(x + 480, tbl_y + 3, x + 575, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("AZIMUTH", wl_bold, D2D1::RectF(x + 580, tbl_y + 3, x + 660, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("HOURS", wl_bold, D2D1::RectF(x + 665, tbl_y + 3, x + 775, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("SERVICE", wl_bold, D2D1::RectF(x + 780, tbl_y + 3, x + 875, tbl_y + 2 + th_h), r.hex_color(0x94A3B8));
+        r.draw_text("RIG QSY ACTION", wl_bold, D2D1::RectF(x + 880, tbl_y + 3, x + w - 12, tbl_y + 2 + th_h), r.hex_color(0x00E5FF));
 
         // Data Rows
-        float ry = tbl_y + 26.0f;
-        float rh = 24.0f;
-        int max_gw_rows = static_cast<int>((tbl_h - 28.0f) / rh);
+        float ry = tbl_y + 4.0f + th_h;
+        float rh = std::max(22.0f, std::round(24.0f * sc));
+        int max_gw_rows = std::max(1, static_cast<int>((tbl_h - th_h - 6.0f) / rh));
 
         for (size_t i = 0; i < hs.winlink.filtered_gateways.size() && static_cast<int>(i) < max_gw_rows; ++i) {
             const auto& gw = hs.winlink.filtered_gateways[i];
             bool is_sel = (static_cast<int>(i) == hs.winlink.selected_gateway_idx);
             D2D1_RECT_F row_r = D2D1::RectF(x + 2, ry, x + w - 2, ry + rh);
 
-            // Rank gateways by distance to operator QTH:
-            // < 500 km = Light Green (Best), 500..1500 km = Light Yellow (Moderate), >= 1500 km = Light Red (Distant)
-            uint32_t rank_col = 0x22C55E; // Light Green (Best)
+            uint32_t rank_col = 0x22C55E;
             float rank_alpha = 0.16f;
             if (gw.distance_km >= 1500.0) {
-                rank_col = 0xEF4444;      // Light Red (Distant)
+                rank_col = 0xEF4444;
                 rank_alpha = 0.12f;
             } else if (gw.distance_km >= 500.0) {
-                rank_col = 0xEAB308;      // Light Yellow (Moderate)
+                rank_col = 0xEAB308;
                 rank_alpha = 0.14f;
             }
 
@@ -3800,25 +3898,23 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
                 r.fill_round_rect(row_r, 4.0f, r.hex_color(rank_col, rank_alpha));
             }
 
-            // Left ranking indicator stripe
             r.fill_round_rect(D2D1::RectF(x + 2, ry + 2.0f, x + 6.0f, ry + rh - 2.0f), 1.5f, r.hex_color(rank_col, 0.85f));
 
-            r.draw_text(gw.callsign, r.font_mono, D2D1::RectF(x + 12, ry + 4, x + 120, ry + 22), r.hex_color(is_sel ? 0x00E5FF : 0x38BDF8));
-            r.draw_text(hamshack::FlrigCatEngine::format_freq_mhz(gw.freq_hz) + " MHz", r.font_mono_small, D2D1::RectF(x + 125, ry + 4, x + 235, ry + 22), r.hex_color(0x34D399));
-            r.draw_text(gw.mode, r.font_mono_small, D2D1::RectF(x + 240, ry + 4, x + 380, ry + 22), r.hex_color(0xFBBF24));
-            r.draw_text(gw.grid, r.font_mono_small, D2D1::RectF(x + 385, ry + 4, x + 465, ry + 22), r.hex_color(0xCBD5E1));
+            r.draw_text(gw.callsign, wl_mono_lg, D2D1::RectF(x + 12, ry + 2, x + 125, ry + rh - 2), r.hex_color(is_sel ? 0x00E5FF : 0x38BDF8));
+            r.draw_text(hamshack::FlrigCatEngine::format_freq_mhz(gw.freq_hz) + " MHz", wl_mono, D2D1::RectF(x + 130, ry + 2, x + 245, ry + rh - 2), r.hex_color(0x34D399));
+            r.draw_text(gw.mode, wl_mono, D2D1::RectF(x + 250, ry + 2, x + 390, ry + rh - 2), r.hex_color(0xFBBF24));
+            r.draw_text(gw.grid, wl_mono, D2D1::RectF(x + 395, ry + 2, x + 475, ry + rh - 2), r.hex_color(0xCBD5E1));
             char d_buf[32];
             std::snprintf(d_buf, sizeof(d_buf), "%.0f km", gw.distance_km);
-            r.draw_text(d_buf, r.font_mono_small, D2D1::RectF(x + 470, ry + 4, x + 560, ry + 22), r.hex_color(rank_col));
+            r.draw_text(d_buf, wl_mono, D2D1::RectF(x + 480, ry + 2, x + 575, ry + rh - 2), r.hex_color(rank_col));
             char a_buf[32];
             std::snprintf(a_buf, sizeof(a_buf), "%.0f°", gw.azimuth_deg);
-            r.draw_text(a_buf, r.font_mono_small, D2D1::RectF(x + 565, ry + 4, x + 645, ry + 22), r.hex_color(0x94A3B8));
-            r.draw_text(gw.hours, r.font_mono_small, D2D1::RectF(x + 650, ry + 4, x + 760, ry + 22), r.hex_color(0x94A3B8));
-            r.draw_text(gw.service, r.font_mono_small, D2D1::RectF(x + 765, ry + 4, x + 860, ry + 22), r.hex_color(0x64748B));
+            r.draw_text(a_buf, wl_mono, D2D1::RectF(x + 580, ry + 2, x + 660, ry + rh - 2), r.hex_color(0x94A3B8));
+            r.draw_text(gw.hours, wl_mono, D2D1::RectF(x + 665, ry + 2, x + 775, ry + rh - 2), r.hex_color(0x94A3B8));
+            r.draw_text(gw.service, wl_mono, D2D1::RectF(x + 780, ry + 2, x + 875, ry + rh - 2), r.hex_color(0x64748B));
 
-            // [⚡ TUNE & SELECT] Button
             float act_w = 120.0f;
-            draw_hs_btn(r, hs, mouse_pt, x + 865, ry + 1.0f, act_w, 22.0f, HS_WL_GW_ROW_BASE + static_cast<int>(i),
+            draw_hs_btn(r, hs, mouse_pt, x + 880, ry + (rh - 22.0f) * 0.5f, act_w, 22.0f, HS_WL_GW_ROW_BASE + static_cast<int>(i),
                         is_sel ? "✓ SELECTED" : "⚡ TUNE & SELECT", is_sel, is_sel ? 0x10B981 : 0x00E5FF, static_cast<int>(i), "", true);
 
             hs.add_hit(row_r, HS_WL_GW_ROW_BASE + static_cast<int>(i), static_cast<int>(i));
@@ -3836,49 +3932,51 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         r.draw_round_rect(cfg_card, 8.0f, r.hex_color(0x1E293B), 1.0f);
 
         float cy = body_y + 16.0f;
-        r.draw_text("WINLINK 2000 ACCOUNT & MODEM CONFIGURATION", r.font_ui_bold,
-                    D2D1::RectF(x + 24, cy, cfg_card.right - 12, cy + 24), r.hex_color(0x00E5FF));
-        cy += 32.0f;
+        float cfg_bh = std::max(26.0f, std::round(26.0f * sc));
+        float lbl_r_x = x + std::min(left_w * 0.48f, std::max(205.0f, 195.0f * sc));
+        r.draw_text("WINLINK 2000 ACCOUNT & MODEM CONFIGURATION", wl_bold,
+                    D2D1::RectF(x + 24, cy, cfg_card.right - 12, cy + 26 * sc), r.hex_color(0x00E5FF));
+        cy += std::max(30.0f, 30.0f * sc);
 
         // Callsign
-        r.draw_text("Station Callsign:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F call_box = D2D1::RectF(x + 210, cy, std::min(x + 430.0f, cfg_card.right - 16.0f), cy + 26.0f);
+        r.draw_text("Station Callsign:", wl_bold, D2D1::RectF(x + 24, cy + 3, lbl_r_x, cy + cfg_bh), r.hex_color(0x94A3B8));
+        D2D1_RECT_F call_box = D2D1::RectF(lbl_r_x + 5, cy, cfg_card.right - 16.0f, cy + cfg_bh);
         bool call_foc = (hs.text_focus == HsTextFocus::WlCfgCall);
         r.fill_round_rect(call_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(call_box, 4.0f, call_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
-        r.draw_text(cfg.winlink_callsign + (call_foc ? "_" : ""), r.font_mono,
-                    D2D1::RectF(call_box.left + 8, call_box.top + 4, call_box.right - 8, call_box.bottom), r.hex_color(0x38BDF8));
+        r.draw_text(cfg.winlink_callsign + (call_foc ? "_" : ""), wl_mono_lg,
+                    D2D1::RectF(call_box.left + 8, call_box.top + 3, call_box.right - 8, call_box.bottom), r.hex_color(0x38BDF8));
         hs.add_hit(call_box, HS_WL_CFG_CALL_BOX);
-        cy += 34.0f;
+        cy += cfg_bh + 8.0f;
 
         // Password — strictly masked as **** at all times (never plain text!)
-        r.draw_text("Winlink Account Password:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F pass_box = D2D1::RectF(x + 210, cy, std::min(x + 430.0f, cfg_card.right - 16.0f), cy + 26.0f);
+        r.draw_text("Winlink Account Password:", wl_bold, D2D1::RectF(x + 24, cy + 3, lbl_r_x, cy + cfg_bh), r.hex_color(0x94A3B8));
+        D2D1_RECT_F pass_box = D2D1::RectF(lbl_r_x + 5, cy, cfg_card.right - 16.0f, cy + cfg_bh);
         bool pass_foc = (hs.text_focus == HsTextFocus::WlCfgPass);
         r.fill_round_rect(pass_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(pass_box, 4.0f, pass_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
         std::string p_mask = std::string(cfg.winlink_password.size(), '*') + (pass_foc ? "_" : "");
         if (cfg.winlink_password.empty() && !pass_foc) p_mask = "(Optional - masked as ****)";
-        r.draw_text(p_mask, r.font_mono_small,
-                    D2D1::RectF(pass_box.left + 8, pass_box.top + 5, pass_box.right - 8, pass_box.bottom),
+        r.draw_text(p_mask, wl_mono,
+                    D2D1::RectF(pass_box.left + 8, pass_box.top + 4, pass_box.right - 8, pass_box.bottom),
                     pass_foc || !cfg.winlink_password.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
         hs.add_hit(pass_box, HS_WL_CFG_PASS_BOX);
-        cy += 34.0f;
+        cy += cfg_bh + 8.0f;
 
         // Grid Locator
-        r.draw_text("Station Grid Locator:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F grid_box = D2D1::RectF(x + 210, cy, x + 320, cy + 26.0f);
+        r.draw_text("Station Grid Locator:", wl_bold, D2D1::RectF(x + 24, cy + 3, lbl_r_x, cy + cfg_bh), r.hex_color(0x94A3B8));
+        D2D1_RECT_F grid_box = D2D1::RectF(lbl_r_x + 5, cy, std::min(lbl_r_x + 140.0f, cfg_card.right - 16.0f), cy + cfg_bh);
         bool grid_foc = (hs.text_focus == HsTextFocus::WlCfgGrid);
         r.fill_round_rect(grid_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(grid_box, 4.0f, grid_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
-        r.draw_text(cfg.winlink_grid + (grid_foc ? "_" : ""), r.font_mono,
-                    D2D1::RectF(grid_box.left + 8, grid_box.top + 4, grid_box.right - 8, grid_box.bottom), r.hex_color(0x38BDF8));
+        r.draw_text(cfg.winlink_grid + (grid_foc ? "_" : ""), wl_mono_lg,
+                    D2D1::RectF(grid_box.left + 8, grid_box.top + 3, grid_box.right - 8, grid_box.bottom), r.hex_color(0x38BDF8));
         hs.add_hit(grid_box, HS_WL_CFG_GRID_BOX);
-        cy += 40.0f;
+        cy += cfg_bh + 12.0f;
 
         // Transport Selector
-        r.draw_text("Session Transport Mode:", r.font_ui_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 20), r.hex_color(0xF59E0B));
-        cy += 24.0f;
+        r.draw_text("Session Transport Mode:", wl_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 22 * sc), r.hex_color(0xF59E0B));
+        cy += std::max(24.0f, 24.0f * sc);
 
         float tr_bw = (left_w - 44.0f) / 3.0f;
         draw_hs_btn(r, hs, mouse_pt, x + 24,                    cy, tr_bw, 28.0f, HS_WL_CFG_TRANS_TELNET,
@@ -3887,18 +3985,18 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
                     "● ARDOP HF Radio", cfg.winlink_transport == 1, 0x38BDF8, 1, "", true);
         draw_hs_btn(r, hs, mouse_pt, x + 24 + 2*(tr_bw + 8.0f), cy, tr_bw, 28.0f, HS_WL_CFG_TRANS_PACKET,
                     "● Packet AX.25", cfg.winlink_transport == 2, 0xA855F7, 2, "", true);
-        cy += 38.0f;
+        cy += 36.0f;
 
         // ARDOP TNC Settings
-        r.draw_text("ARDOP TNC Settings (pat / ardop):", r.font_ui_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 20), r.hex_color(0xCBD5E1));
-        cy += 24.0f;
+        r.draw_text("ARDOP TNC Settings (pat / ardop):", wl_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 22 * sc), r.hex_color(0xCBD5E1));
+        cy += std::max(22.0f, 22.0f * sc);
         r.draw_text("Host: 127.0.0.1:8515  |  Bandwidth: " + std::to_string(cfg.winlink_ardop_bandwidth) + " Hz  |  Drive: " + std::to_string(cfg.winlink_ardop_drive),
-                    r.font_mono_small, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 18), r.hex_color(0x94A3B8));
-        cy += 24.0f;
+                    wl_mono, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 20 * sc), r.hex_color(0x94A3B8));
+        cy += std::max(24.0f, 24.0f * sc);
 
         draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 170.0f, 26.0f, HS_WL_CFG_BW_CYCLE,
                     "Cycle ARDOP BW (" + std::to_string(cfg.winlink_ardop_bandwidth) + ")", false, 0x38BDF8, 0, "", true);
-        cy += 38.0f;
+        cy += 36.0f;
 
         // Save Button
         draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 160.0f, 32.0f, HS_WL_CFG_SAVE_BTN,
@@ -3913,29 +4011,30 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             r.draw_round_rect(cms_card, 8.0f, r.hex_color(0x1E293B), 1.0f);
 
             float ty = body_y + 16.0f;
-            r.draw_text("WINLINK CMS TELNET CONNECTION PROFILE", r.font_ui_bold,
-                        D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 24), r.hex_color(0x34D399));
-            ty += 24.0f;
+            float cms_lbl_r = rx + std::min(rw * 0.44f, std::max(205.0f, 190.0f * sc));
+            r.draw_text("WINLINK CMS TELNET CONNECTION PROFILE", wl_bold,
+                        D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 24 * sc), r.hex_color(0x34D399));
+            ty += std::max(24.0f, 24.0f * sc);
             r.draw_text("Standard Winlink 2000 CMS Telnet gateway parameters (Airmail / Outpost / B2F v3.2 compatible):",
-                        r.font_small, D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 18), r.hex_color(0x94A3B8));
-            ty += 26.0f;
+                        wl_small, D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 20 * sc), r.hex_color(0x94A3B8));
+            ty += std::max(24.0f, 24.0f * sc);
 
             auto draw_cms_row = [&](const char* param_lbl, const std::string& val_str, const char* note_txt,
                                     int hit_id, HsTextFocus foc_enum, float box_w) {
-                r.draw_text(param_lbl, r.font_ui_bold,
-                            D2D1::RectF(rx + 16, ty + 4, rx + 205, ty + 24), r.hex_color(0xCBD5E1));
-                D2D1_RECT_F ibox = D2D1::RectF(rx + 210, ty, std::min(rx + 210 + box_w, cms_card.right - 16.0f), ty + 26.0f);
+                r.draw_text(param_lbl, wl_bold,
+                            D2D1::RectF(rx + 16, ty + 3, cms_lbl_r, ty + cfg_bh), r.hex_color(0xCBD5E1));
+                D2D1_RECT_F ibox = D2D1::RectF(cms_lbl_r + 5, ty, std::min(cms_lbl_r + 5 + box_w * sc, cms_card.right - 16.0f), ty + cfg_bh);
                 bool foc = (hs.text_focus == foc_enum);
                 r.fill_round_rect(ibox, 4.0f, r.hex_color(0x05080F));
                 r.draw_round_rect(ibox, 4.0f, foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), foc ? 1.5f : 1.0f);
-                r.draw_text(val_str + (foc ? "_" : ""), r.font_mono,
-                            D2D1::RectF(ibox.left + 8, ibox.top + 4, ibox.right - 8, ibox.bottom),
+                r.draw_text(val_str + (foc ? "_" : ""), wl_mono_lg,
+                            D2D1::RectF(ibox.left + 8, ibox.top + 3, ibox.right - 8, ibox.bottom),
                             foc ? r.hex_color(0x00E5FF) : r.hex_color(0x34D399));
                 hs.add_hit(ibox, hit_id);
-                ty += 28.0f;
-                r.draw_text(note_txt, r.font_small,
-                            D2D1::RectF(rx + 210, ty, cms_card.right - 16, ty + 16), r.hex_color(0x64748B));
-                ty += 22.0f;
+                ty += cfg_bh + 2.0f;
+                r.draw_text(note_txt, wl_small,
+                            D2D1::RectF(cms_lbl_r + 5, ty, cms_card.right - 16, ty + 18 * sc), r.hex_color(0x64748B));
+                ty += std::max(20.0f, 20.0f * sc);
             };
 
             draw_cms_row("Remote Host (Server):", cfg.winlink_cms_server,
@@ -5707,13 +5806,13 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
 
                     if (is_dbl) {
                         bool want_ptt = false;
-                        hs.ft8.on_double_click_message(chosen, hs.soundcard, want_ptt);
+                        hs.ft8.on_double_click_message(chosen, hs.soundcard, want_ptt, h.id == HS_FT_RX_FREQ_ROW);
                         if (want_ptt && hs.flrig.connected) {
                             hs.flrig.set_ptt(true);
                         }
                     } else {
-                        hs.ft8.select_decoded_message(chosen);
-                        hs.ft8.tx_enabled = true;
+                        // Single-click ONLY highlights the station in pink — does NOT select or arm TX!
+                        hs.ft8.set_highlighted_message(chosen);
                     }
                 }
                 return true;
@@ -6101,6 +6200,57 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
             }
             case HS_WL_ABORT_SESSION:    hs.winlink.abort_session(); return true;
             case HS_WL_CLEAR_SESSION:    hs.winlink.clear_session_log(); return true;
+            case HS_WL_ZOOM_OUT: {
+                hs.winlink_font_size = std::max(9.0f, hs.winlink_font_size - 1.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = hs.winlink_font_size;
+                cfg.save();
+                return true;
+            }
+            case HS_WL_ZOOM_RESET: {
+                hs.winlink_font_size = 13.0f;
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = 13.0f;
+                cfg.save();
+                return true;
+            }
+            case HS_WL_ZOOM_IN: {
+                hs.winlink_font_size = std::min(26.0f, hs.winlink_font_size + 1.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_font_size = hs.winlink_font_size;
+                cfg.save();
+                return true;
+            }
+            case HS_WL_GW_REFRESH_BTN: {
+                auto& cfg = hamshack::get_app_config();
+                hs.winlink.refresh_gateways_from_web(cfg.winlink_grid);
+                app.log_public_system("[WINLINK] Refreshing live RMS gateway list from api.winlink.org...");
+                return true;
+            }
+            case HS_WL_SIDEBAR_SPLIT:
+                hs.dragging_wl_sidebar = true;
+                hs.wl_drag_start_x = pt.x;
+                hs.wl_drag_start_val = hs.winlink_sidebar_w;
+                return true;
+            case HS_WL_LOG_SPLIT:
+                hs.dragging_wl_log = true;
+                hs.wl_drag_start_y = pt.y;
+                hs.wl_drag_start_val = hs.winlink_log_extra_h;
+                return true;
+            case HS_WL_LOG_TALLER: {
+                hs.winlink_log_extra_h = std::clamp(hs.winlink_log_extra_h + 60.0f, 0.0f, 280.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_log_extra_h = hs.winlink_log_extra_h;
+                cfg.save();
+                return true;
+            }
+            case HS_WL_LOG_SHORTER: {
+                hs.winlink_log_extra_h = std::clamp(hs.winlink_log_extra_h - 60.0f, 0.0f, 280.0f);
+                auto& cfg = hamshack::get_app_config();
+                cfg.winlink_log_extra_h = hs.winlink_log_extra_h;
+                cfg.save();
+                return true;
+            }
             case HS_WL_GW_SEARCH_BOX:    hs.text_focus = HsTextFocus::WlGwSearch; return true;
             case HS_WL_GW_MODE_ALL:      hs.winlink.filter_gateways(hs.winlink.gateway_search_query, "All", hs.hf_grid); return true;
             case HS_WL_GW_MODE_ARDOP:    hs.winlink.filter_gateways(hs.winlink.gateway_search_query, "ARDOP", hs.hf_grid); return true;
@@ -6355,7 +6505,7 @@ inline bool handle_hamshack_double_click(AppT& /*app*/, HamShackSuite& hs, POINT
             }
             if (ok) {
                 bool want_ptt = false;
-                hs.ft8.on_double_click_message(chosen, hs.soundcard, want_ptt);
+                hs.ft8.on_double_click_message(chosen, hs.soundcard, want_ptt, h.id == HS_FT_RX_FREQ_ROW);
                 if (want_ptt && hs.flrig.connected) {
                     hs.flrig.set_ptt(true);
                 }
