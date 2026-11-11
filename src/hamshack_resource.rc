@@ -4,8 +4,8 @@
 101 ICON "AppIcon.ico"
 
 VS_VERSION_INFO VERSIONINFO
-FILEVERSION     1,4,0,0
-PRODUCTVERSION  1,4,0,0
+FILEVERSION     1,5,0,0
+PRODUCTVERSION  1,5,0,0
 FILEFLAGSMASK   VS_FFI_FILEFLAGSMASK
 FILEFLAGS       0x0L
 FILEOS          VOS_NT_WINDOWS32
@@ -18,11 +18,11 @@ BEGIN
         BEGIN
             VALUE "CompanyName",      "HamShack++ Amateur Radio Systems\0"
             VALUE "FileDescription",  "HamShack++ Native C++20 Unified Amateur Radio Suite (FLRig, FT8/FT4, JS8Call, CW, APRS, SSTV, Winlink, IRC & MeshCore++)\0"
-            VALUE "FileVersion",      "1.4.0.0\0"
+            VALUE "FileVersion",      "1.5.0.0\0"
             VALUE "InternalName",     "HamShack++\0"
             VALUE "OriginalFilename", "HamShack++.exe\0"
             VALUE "ProductName",      "HamShack++ Unified Communications Suite\0"
-            VALUE "ProductVersion",   "1.4.0\0"
+            VALUE "ProductVersion",   "1.5.0\0"
         END
     END
     BLOCK "VarFileInfo"

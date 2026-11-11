@@ -109,7 +109,7 @@ HamShack++ integrates and attributes the core DSP modems, protocols, and workflo
 ### 9. Pat / Winlink & ARDOP — Global Radio Email & 4,807 RMS Gateways (`includes/winlink_engine.hpp`, `includes/winlink_gateways_data.hpp`, `includes/ardop_modem.hpp`)
 ![Winlink B2F Mailbox & ARDOP HF TNC](screenshots/08-winlink-mailbox.png)
 
-* **Full B2F v3.2 Binary Forwarding Protocol**: Native implementation of Winlink's B2F protocol (`F>` proposal negotiation, `FS` responses, LZHUF compression, binary attachment framing, and checksum verification) across **Inbox**, **Outbox**, **Sent**, and **Archive** mailboxes.
+* **Full B2F v3.2 Binary Forwarding Protocol & CMS Telnet Profile**: Native implementation of Winlink's B2F protocol (`F>` proposal negotiation, `FS` responses, MD5 `;PQ:`/`:PR:` secure login challenge-response, binary attachment framing, and one-click **Clear Session** transcript controls) across **Inbox**, **Outbox**, **Sent**, and **Archive** mailboxes, with pre-configured **Winlink CMS Telnet** gateway profile (`cms.winlink.org:8772`, remote callsign `WL2K`, Telnet gate passcode `CMSTELNET`, `30s` socket timeout, and strictly masked `****` account password).
 * **Built-in In-Process ARDOP HF Soundcard TNC (`127.0.0.1:8515`)**: Eliminates external TNC executables by running an integrated ARDOP modem (`500 Hz`, `1000 Hz`, `2000 Hz` bandwidths) tied directly to the soundcard and Xiegu G90 CAT PTT.
 
 ![Winlink 4,807 RMS Gateways Directory](screenshots/09-winlink-gateways.png)

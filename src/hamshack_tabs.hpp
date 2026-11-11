@@ -275,6 +275,8 @@ enum HsHitId : int {
     HS_WL_CFG_GRID_BOX     = 1715,
     HS_WL_CFG_BW_CYCLE     = 1716,
     HS_WL_CFG_SAVE_BTN     = 1717,
+    HS_WL_CLEAR_SESSION    = 1718,
+    HS_WL_CFG_CMS_HOST_BOX = 1719,
 
     // Twitch Live Streaming Studio
     HS_TWITCH_STREAM_TOGGLE = 1720,
@@ -283,6 +285,13 @@ enum HsHitId : int {
     HS_TWITCH_CHANNEL_BOX   = 1723,
     HS_TWITCH_KEY_BOX       = 1724,
     HS_TWITCH_SAVE_BTN      = 1725,
+
+    // Winlink CMS Telnet Connection Profile Controls
+    HS_WL_CFG_CMS_PORT_BOX  = 1728,
+    HS_WL_CFG_CMS_CALL_BOX  = 1729,
+    HS_WL_CFG_CMS_PASS_BOX  = 1730,
+    HS_WL_CFG_CMS_TMO_BOX   = 1731,
+    HS_WL_CFG_CMS_RESET_BTN = 1732,
 
     // Carbon Engine Tabs: APRS (Tab 9) & SSTV (Tab 10) + Lock-Free AudioRouter Dropdown
     HS_TAB_APRS             = 1810,
@@ -366,7 +375,12 @@ enum class HsTextFocus : int {
     AprsComment = 32,
     AprsMsgTo = 33,
     AprsMsgText = 34,
-    SstvOverlay = 35
+    SstvOverlay = 35,
+    WlCfgCmsHost = 36,
+    WlCfgCmsPort = 37,
+    WlCfgCmsCall = 38,
+    WlCfgCmsPass = 39,
+    WlCfgCmsTimeout = 40
 };
 
 using LogQsoDialogState = hamshack::LogQsoDialogState;
@@ -469,6 +483,9 @@ struct HamShackSuite {
     std::string sstv_overlay_edit = "W1AW  FN31";
     std::string sstv_status_banner = "Ready — Auto VIS Armed (14 Modes: Scottie, Martin, Robot B&W/Color, PD120)";
 
+    std::string wl_cms_port_edit = "8772";
+    std::string wl_cms_timeout_edit = "30";
+
     std::vector<HsHitRect> hits;
 
     HamShackSuite() {
@@ -502,6 +519,9 @@ struct HamShackSuite {
             winlink.selected_gateway_freq = cfg.winlink_selected_freq;
             winlink.selected_gateway_mode = cfg.winlink_selected_mode;
         }
+        wl_cms_port_edit = std::to_string((cfg.winlink_cms_port >= 1 && cfg.winlink_cms_port <= 65535) ? cfg.winlink_cms_port : 8772);
+        wl_cms_timeout_edit = std::to_string(std::clamp(cfg.winlink_cms_timeout_sec, 5, 300));
+        winlink.modem_info = cfg.winlink_cms_server + ":" + wl_cms_port_edit + " (" + cfg.winlink_cms_call + " • " + wl_cms_timeout_edit + "s)";
 
         // Initialize Carbon Engine lock-free AudioRouter, APRS KISS/AX.25 Engine, and 14-Mode SSTV Transceiver
         audio_router = std::make_unique<hamshack::carbon::AudioRouter>();
@@ -1773,11 +1793,11 @@ inline void render_global_bottom_tab_bar(RendererT& r, AppT& app, HamShackSuite&
         {HS_TAB_CW,     2,  "CW Keyer",      0xFBBF24},
         {HS_TAB_APRS,   9,  "APRS",          0x22D3EE},
         {HS_TAB_SSTV,   10, "SSTV",          0xF472B6},
+        {HS_TAB_WINLINK,7,  "Winlink",       0x34D399},
         {HS_TAB_MESH,   3,  "MeshCore",      0xA855F7},
         {HS_TAB_GT,     4,  "Grid Tracker",  0xF59E0B},
         {HS_TAB_PAGES,  5,  "Pages",         0x38BDF8},
         {HS_TAB_IRC,    6,  "IRC",           0xEC4899},
-        {HS_TAB_WINLINK,7,  "Winlink",       0x34D399},
         {HS_TAB_CONFIG, 8,  "Configuration", 0x94A3B8}
     };
 
@@ -3601,7 +3621,7 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         std::string trans_full = (cfg.winlink_transport == 0) ? "Telnet CMS Direct Socket" : (cfg.winlink_transport == 1) ? "ARDOP HF Soundcard TNC" : "Packet AX.25 TNC";
         r.draw_text(trans_full, r.font_mono_small, D2D1::RectF(card2.left + 8, card2.top + 26, card2.right - 8, card2.top + 44), r.hex_color(0x34D399));
         std::string mod_meta = (cfg.winlink_transport == 0)
-            ? "Host: cms.winlink.org:8772"
+            ? ("Host: " + cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) + " (" + cfg.winlink_cms_call + ")")
             : (hs.winlink.ardop_modem.is_running()
                 ? "ARDOP: ● ONLINE (127.0.0.1:8515)"
                 : "ARDOP: ○ STANDBY (Auto-starts on TX)");
@@ -3662,12 +3682,16 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
             D2D1_RECT_F log_box = D2D1::RectF(rx + 6, sy, rx + sb_w - 6, sy + log_h);
             r.fill_round_rect(log_box, 5.0f, r.hex_color(0x05080F));
             r.draw_round_rect(log_box, 5.0f, r.hex_color(0x1E293B), 1.0f);
-            r.draw_text("SESSION LOG (B2F TRANSCRIPT)", r.font_ui_bold, D2D1::RectF(log_box.left + 8, log_box.top + 4, log_box.right - 8, log_box.top + 20), r.hex_color(0x64748B));
+            r.draw_text("SESSION LOG (B2F)", r.font_ui_bold,
+                        D2D1::RectF(log_box.left + 8, log_box.top + 5, log_box.right - 102, log_box.top + 23),
+                        r.hex_color(0x64748B));
+            draw_hs_btn(r, hs, mouse_pt, log_box.right - 98.0f, log_box.top + 3.0f, 92.0f, 20.0f,
+                        HS_WL_CLEAR_SESSION, "Clear Session", false, 0x94A3B8, 0, "", true);
 
             std::lock_guard<std::recursive_mutex> lk(hs.winlink.mtx);
-            float ly = log_box.top + 22.0f;
+            float ly = log_box.top + 26.0f;
             float lh = 16.0f;
-            int max_lines = static_cast<int>((log_h - 26.0f) / lh);
+            int max_lines = std::max(1, static_cast<int>((log_h - 30.0f) / lh));
             int start_idx = std::max(0, static_cast<int>(hs.winlink.session_transcript.size()) - max_lines);
             for (size_t i = start_idx; i < hs.winlink.session_transcript.size(); ++i) {
                 const auto& line = hs.winlink.session_transcript[i];
@@ -3802,22 +3826,23 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         }
     }
     // ------------------------------------------------------------------------
-    // SUBTAB 2: CONFIGURATION
+    // SUBTAB 2: CONFIGURATION (Account + Masked Password + CMS Telnet Profile)
     // ------------------------------------------------------------------------
     else if (hs.active_winlink_subtab == 2) {
-        float cfg_w = std::min(680.0f, w - 20.0f);
-        D2D1_RECT_F cfg_card = D2D1::RectF(x + 10, body_y, x + 10 + cfg_w, body_y + body_h);
+        float col_gap = 14.0f;
+        float left_w = std::clamp((w - 20.0f - col_gap) * 0.46f, 420.0f, 640.0f);
+        D2D1_RECT_F cfg_card = D2D1::RectF(x + 10, body_y, x + 10 + left_w, body_y + body_h);
         r.fill_round_rect(cfg_card, 8.0f, r.hex_color(0x0F172A));
         r.draw_round_rect(cfg_card, 8.0f, r.hex_color(0x1E293B), 1.0f);
 
         float cy = body_y + 16.0f;
         r.draw_text("WINLINK 2000 ACCOUNT & MODEM CONFIGURATION", r.font_ui_bold,
-                    D2D1::RectF(x + 24, cy, x + cfg_w, cy + 24), r.hex_color(0x00E5FF));
+                    D2D1::RectF(x + 24, cy, cfg_card.right - 12, cy + 24), r.hex_color(0x00E5FF));
         cy += 32.0f;
 
         // Callsign
-        r.draw_text("Station Callsign:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 200, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F call_box = D2D1::RectF(x + 210, cy, x + 400, cy + 26.0f);
+        r.draw_text("Station Callsign:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
+        D2D1_RECT_F call_box = D2D1::RectF(x + 210, cy, std::min(x + 430.0f, cfg_card.right - 16.0f), cy + 26.0f);
         bool call_foc = (hs.text_focus == HsTextFocus::WlCfgCall);
         r.fill_round_rect(call_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(call_box, 4.0f, call_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
@@ -3826,14 +3851,14 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         hs.add_hit(call_box, HS_WL_CFG_CALL_BOX);
         cy += 34.0f;
 
-        // Password
-        r.draw_text("Winlink CMS Password:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 200, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F pass_box = D2D1::RectF(x + 210, cy, x + 400, cy + 26.0f);
+        // Password — strictly masked as **** at all times (never plain text!)
+        r.draw_text("Winlink Account Password:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
+        D2D1_RECT_F pass_box = D2D1::RectF(x + 210, cy, std::min(x + 430.0f, cfg_card.right - 16.0f), cy + 26.0f);
         bool pass_foc = (hs.text_focus == HsTextFocus::WlCfgPass);
         r.fill_round_rect(pass_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(pass_box, 4.0f, pass_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
-        std::string p_mask = pass_foc ? (cfg.winlink_password + "_") : std::string(cfg.winlink_password.size(), '*');
-        if (p_mask.empty() && !pass_foc) p_mask = "(Optional - set if required by CMS)";
+        std::string p_mask = std::string(cfg.winlink_password.size(), '*') + (pass_foc ? "_" : "");
+        if (cfg.winlink_password.empty() && !pass_foc) p_mask = "(Optional - masked as ****)";
         r.draw_text(p_mask, r.font_mono_small,
                     D2D1::RectF(pass_box.left + 8, pass_box.top + 5, pass_box.right - 8, pass_box.bottom),
                     pass_foc || !cfg.winlink_password.empty() ? r.hex_color(0xF8FAFC) : r.hex_color(0x64748B));
@@ -3841,8 +3866,8 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         cy += 34.0f;
 
         // Grid Locator
-        r.draw_text("Station Grid Locator:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 200, cy + 24), r.hex_color(0x94A3B8));
-        D2D1_RECT_F grid_box = D2D1::RectF(x + 210, cy, x + 310, cy + 26.0f);
+        r.draw_text("Station Grid Locator:", r.font_ui_bold, D2D1::RectF(x + 24, cy + 4, x + 205, cy + 24), r.hex_color(0x94A3B8));
+        D2D1_RECT_F grid_box = D2D1::RectF(x + 210, cy, x + 320, cy + 26.0f);
         bool grid_foc = (hs.text_focus == HsTextFocus::WlCfgGrid);
         r.fill_round_rect(grid_box, 4.0f, r.hex_color(0x05080F));
         r.draw_round_rect(grid_box, 4.0f, grid_foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), 1.0f);
@@ -3852,31 +3877,89 @@ inline void render_winlink_workspace(RendererT& r, AppT& app, HamShackSuite& hs,
         cy += 40.0f;
 
         // Transport Selector
-        r.draw_text("Session Transport Mode:", r.font_ui_bold, D2D1::RectF(x + 24, cy, x + cfg_w, cy + 20), r.hex_color(0xF59E0B));
+        r.draw_text("Session Transport Mode:", r.font_ui_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 20), r.hex_color(0xF59E0B));
         cy += 24.0f;
 
-        draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 180.0f, 28.0f, HS_WL_CFG_TRANS_TELNET,
-                    "● Telnet CMS (Internet)", cfg.winlink_transport == 0, 0x10B981, 0, "", true);
-        draw_hs_btn(r, hs, mouse_pt, x + 212, cy, 180.0f, 28.0f, HS_WL_CFG_TRANS_ARDOP,
+        float tr_bw = (left_w - 44.0f) / 3.0f;
+        draw_hs_btn(r, hs, mouse_pt, x + 24,                    cy, tr_bw, 28.0f, HS_WL_CFG_TRANS_TELNET,
+                    "● Telnet CMS", cfg.winlink_transport == 0, 0x10B981, 0, "", true);
+        draw_hs_btn(r, hs, mouse_pt, x + 24 + tr_bw + 8.0f,     cy, tr_bw, 28.0f, HS_WL_CFG_TRANS_ARDOP,
                     "● ARDOP HF Radio", cfg.winlink_transport == 1, 0x38BDF8, 1, "", true);
-        draw_hs_btn(r, hs, mouse_pt, x + 400, cy, 180.0f, 28.0f, HS_WL_CFG_TRANS_PACKET,
+        draw_hs_btn(r, hs, mouse_pt, x + 24 + 2*(tr_bw + 8.0f), cy, tr_bw, 28.0f, HS_WL_CFG_TRANS_PACKET,
                     "● Packet AX.25", cfg.winlink_transport == 2, 0xA855F7, 2, "", true);
         cy += 38.0f;
 
         // ARDOP TNC Settings
-        r.draw_text("ARDOP TNC Settings (pat / ardop):", r.font_ui_bold, D2D1::RectF(x + 24, cy, x + cfg_w, cy + 20), r.hex_color(0xCBD5E1));
+        r.draw_text("ARDOP TNC Settings (pat / ardop):", r.font_ui_bold, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 20), r.hex_color(0xCBD5E1));
         cy += 24.0f;
         r.draw_text("Host: 127.0.0.1:8515  |  Bandwidth: " + std::to_string(cfg.winlink_ardop_bandwidth) + " Hz  |  Drive: " + std::to_string(cfg.winlink_ardop_drive),
-                    r.font_mono_small, D2D1::RectF(x + 24, cy, x + cfg_w, cy + 18), r.hex_color(0x94A3B8));
+                    r.font_mono_small, D2D1::RectF(x + 24, cy, cfg_card.right - 16, cy + 18), r.hex_color(0x94A3B8));
         cy += 24.0f;
 
-        draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 160.0f, 26.0f, HS_WL_CFG_BW_CYCLE,
+        draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 170.0f, 26.0f, HS_WL_CFG_BW_CYCLE,
                     "Cycle ARDOP BW (" + std::to_string(cfg.winlink_ardop_bandwidth) + ")", false, 0x38BDF8, 0, "", true);
         cy += 38.0f;
 
         // Save Button
-        draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 150.0f, 32.0f, HS_WL_CFG_SAVE_BTN,
+        draw_hs_btn(r, hs, mouse_pt, x + 24, cy, 160.0f, 32.0f, HS_WL_CFG_SAVE_BTN,
                     "💾 Save Config", false, 0x10B981, 0, "", true);
+
+        // ---- RIGHT CARD: WINLINK CMS TELNET CONNECTION PROFILE ----
+        float rx = cfg_card.right + col_gap;
+        float rw = (x + w - 10.0f) - rx;
+        if (rw > 280.0f) {
+            D2D1_RECT_F cms_card = D2D1::RectF(rx, body_y, rx + rw, body_y + body_h);
+            r.fill_round_rect(cms_card, 8.0f, r.hex_color(0x0F172A));
+            r.draw_round_rect(cms_card, 8.0f, r.hex_color(0x1E293B), 1.0f);
+
+            float ty = body_y + 16.0f;
+            r.draw_text("WINLINK CMS TELNET CONNECTION PROFILE", r.font_ui_bold,
+                        D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 24), r.hex_color(0x34D399));
+            ty += 24.0f;
+            r.draw_text("Standard Winlink 2000 CMS Telnet gateway parameters (Airmail / Outpost / B2F v3.2 compatible):",
+                        r.font_small, D2D1::RectF(rx + 16, ty, cms_card.right - 16, ty + 18), r.hex_color(0x94A3B8));
+            ty += 26.0f;
+
+            auto draw_cms_row = [&](const char* param_lbl, const std::string& val_str, const char* note_txt,
+                                    int hit_id, HsTextFocus foc_enum, float box_w) {
+                r.draw_text(param_lbl, r.font_ui_bold,
+                            D2D1::RectF(rx + 16, ty + 4, rx + 205, ty + 24), r.hex_color(0xCBD5E1));
+                D2D1_RECT_F ibox = D2D1::RectF(rx + 210, ty, std::min(rx + 210 + box_w, cms_card.right - 16.0f), ty + 26.0f);
+                bool foc = (hs.text_focus == foc_enum);
+                r.fill_round_rect(ibox, 4.0f, r.hex_color(0x05080F));
+                r.draw_round_rect(ibox, 4.0f, foc ? r.hex_color(0x00E5FF) : r.hex_color(0x334155), foc ? 1.5f : 1.0f);
+                r.draw_text(val_str + (foc ? "_" : ""), r.font_mono,
+                            D2D1::RectF(ibox.left + 8, ibox.top + 4, ibox.right - 8, ibox.bottom),
+                            foc ? r.hex_color(0x00E5FF) : r.hex_color(0x34D399));
+                hs.add_hit(ibox, hit_id);
+                ty += 28.0f;
+                r.draw_text(note_txt, r.font_small,
+                            D2D1::RectF(rx + 210, ty, cms_card.right - 16, ty + 16), r.hex_color(0x64748B));
+                ty += 22.0f;
+            };
+
+            draw_cms_row("Remote Host (Server):", cfg.winlink_cms_server,
+                         "Do not use old IP addresses or dead regional server names.",
+                         HS_WL_CFG_CMS_HOST_BOX, HsTextFocus::WlCfgCmsHost, 240.0f);
+            draw_cms_row("TCP Port:", hs.wl_cms_port_edit,
+                         "Standard outbound Winlink Telnet port (8772).",
+                         HS_WL_CFG_CMS_PORT_BOX, HsTextFocus::WlCfgCmsPort, 120.0f);
+            draw_cms_row("Remote Call Sign:", cfg.winlink_cms_call,
+                         "Not case-sensitive (WL2K).",
+                         HS_WL_CFG_CMS_CALL_BOX, HsTextFocus::WlCfgCmsCall, 140.0f);
+            draw_cms_row("Password / Passcode:", cfg.winlink_cms_passcode,
+                         "Case-insensitive; used strictly for the Telnet gate, not your web password.",
+                         HS_WL_CFG_CMS_PASS_BOX, HsTextFocus::WlCfgCmsPass, 180.0f);
+            draw_cms_row("Timeout (Seconds):", hs.wl_cms_timeout_edit,
+                         "Seconds before CMS Telnet connect / socket I/O timeout (30).",
+                         HS_WL_CFG_CMS_TMO_BOX, HsTextFocus::WlCfgCmsTimeout, 120.0f);
+
+            ty += 8.0f;
+            draw_hs_btn(r, hs, mouse_pt, rx + 16, ty, 170.0f, 30.0f, HS_WL_CFG_SAVE_BTN,
+                        "💾 Save CMS Profile", false, 0x10B981, 0, "", true);
+            draw_hs_btn(r, hs, mouse_pt, rx + 196, ty, 195.0f, 30.0f, HS_WL_CFG_CMS_RESET_BTN,
+                        "↺ Reset CMS Defaults", false, 0xF59E0B, 0, "", true);
+        }
     }
 }
 
@@ -4143,7 +4226,50 @@ inline void render_configuration_workspace(RendererT& r, AppT& app, HamShackSuit
                 D2D1::RectF(mr_box.left + 8, y3 + 42, mr_box.right - 8, y3 + 60), r.hex_color(0xC084FC));
     r.draw_text("XML-RPC SERVER:   http://127.0.0.1:" + std::to_string(hs.flrig.xmlrpc_port) + "/RPC2", r.font_mono_small,
                 D2D1::RectF(mr_box.left + 8, y3 + 61, mr_box.right - 8, y3 + 80), r.hex_color(0x38BDF8));
-    y3 += 88.0f;
+    y3 += 86.0f;
+
+    // Winlink CMS Telnet Connection Profile Box (Global Config Tab Mirror)
+    {
+        float cms_h = 112.0f;
+        D2D1_RECT_F wlc_box = D2D1::RectF(x3 + 10, y3, x3 + col_w - 10, y3 + cms_h);
+        r.fill_round_rect(wlc_box, 6.0f, r.hex_color(0x05080F));
+        r.draw_round_rect(wlc_box, 6.0f, r.hex_color(0x34D399, 0.55f), 1.0f);
+        r.draw_text("WINLINK CMS TELNET CONFIG", r.font_ui_bold,
+                    D2D1::RectF(wlc_box.left + 8, y3 + 4, wlc_box.right - 134, y3 + 22), r.hex_color(0x34D399));
+        draw_hs_btn(r, hs, mouse_pt, wlc_box.right - 130, y3 + 3, 60, 20, HS_WL_CFG_SAVE_BTN, "Save", false, 0x10B981, 0, "", true);
+        draw_hs_btn(r, hs, mouse_pt, wlc_box.right - 66,  y3 + 3, 60, 20, HS_WL_CFG_CMS_RESET_BTN, "Reset", false, 0xF59E0B, 0, "", true);
+
+        auto draw_mini_cms = [&](float fx, float fy, float fw, const std::string& pfx, const std::string& val,
+                                 int hit_id, HsTextFocus foc_t) {
+            D2D1_RECT_F fb = D2D1::RectF(fx, fy, fx + fw, fy + 24.0f);
+            bool foc = (hs.text_focus == foc_t);
+            r.fill_round_rect(fb, 4.0f, r.hex_color(0x0F172A));
+            r.draw_round_rect(fb, 4.0f, foc ? r.hex_color(0x00E5FF) : r.hex_color(0x26354D), 1.0f);
+            r.draw_text(pfx + val + (foc ? "_" : ""), r.font_mono_small,
+                        D2D1::RectF(fb.left + 6, fb.top + 3, fb.right - 4, fb.bottom),
+                        foc ? r.hex_color(0x00E5FF) : r.hex_color(0xF8FAFC));
+            hs.add_hit(fb, hit_id);
+        };
+
+        float row1_y = y3 + 28.0f;
+        float in_w = (col_w - 32.0f);
+        float host_w = in_w * 0.66f;
+        float port_w = in_w - host_w - 6.0f;
+        draw_mini_cms(wlc_box.left + 6, row1_y, host_w, "Host: ", cfg.winlink_cms_server, HS_WL_CFG_CMS_HOST_BOX, HsTextFocus::WlCfgCmsHost);
+        draw_mini_cms(wlc_box.left + 6 + host_w + 6.0f, row1_y, port_w, "Port: ", hs.wl_cms_port_edit, HS_WL_CFG_CMS_PORT_BOX, HsTextFocus::WlCfgCmsPort);
+
+        float row2_y = y3 + 56.0f;
+        float c_w1 = (in_w - 12.0f) * 0.28f;
+        float c_w2 = (in_w - 12.0f) * 0.44f;
+        float c_w3 = (in_w - 12.0f) - c_w1 - c_w2;
+        draw_mini_cms(wlc_box.left + 6, row2_y, c_w1, "Call: ", cfg.winlink_cms_call, HS_WL_CFG_CMS_CALL_BOX, HsTextFocus::WlCfgCmsCall);
+        draw_mini_cms(wlc_box.left + 6 + c_w1 + 6.0f, row2_y, c_w2, "Gate: ", cfg.winlink_cms_passcode, HS_WL_CFG_CMS_PASS_BOX, HsTextFocus::WlCfgCmsPass);
+        draw_mini_cms(wlc_box.left + 6 + c_w1 + c_w2 + 12.0f, row2_y, c_w3, "Tmo: ", hs.wl_cms_timeout_edit + "s", HS_WL_CFG_CMS_TMO_BOX, HsTextFocus::WlCfgCmsTimeout);
+
+        r.draw_text("Telnet Gate Passcode = CMSTELNET (not web password) • WL2K • 30s timeout",
+                    r.font_small, D2D1::RectF(wlc_box.left + 8, y3 + 85.0f, wlc_box.right - 8, y3 + 106.0f), r.hex_color(0x64748B));
+        y3 += cms_h + 6.0f;
+    }
 
     float bw_p = (col_w - 28.0f) / 3.0f;
     draw_hs_btn(r, hs, mouse_pt, x3 + 10,               y3, bw_p, 26, HS_CAT_POLL_VFO,    "Poll VFO (0x03)",    false, 0x00E5FF, 0, "", true);
@@ -5899,9 +6025,12 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
                     auto& cfg = hamshack::get_app_config();
                     cfg.winlink_transport = 0; // Telnet
                     cfg.save();
+                    std::string cms_call = cfg.winlink_cms_call.empty() ? "WL2K" : cfg.winlink_cms_call;
                     hs.winlink.start_session("Telnet", cfg.winlink_callsign, cfg.winlink_password, cfg.winlink_grid,
-                                             "CMS", 0);
-                    app.log_public_system("[WINLINK] Initiating email session via Web / CMS Telnet to cms.winlink.org:8772");
+                                             cms_call, 0);
+                    app.log_public_system("[WINLINK] Initiating email session via Web / CMS Telnet to " +
+                                          cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) +
+                                          " (" + cms_call + ")");
                 } else {
                     hs.winlink.abort_session();
                     app.log_public_system("[WINLINK] Aborted email session.");
@@ -5957,9 +6086,12 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
                     }
                 } else {
                     if (!hs.winlink.session_active) {
+                        std::string cms_call = cfg.winlink_cms_call.empty() ? "WL2K" : cfg.winlink_cms_call;
                         hs.winlink.start_session("Telnet", cfg.winlink_callsign, cfg.winlink_password, cfg.winlink_grid,
-                                                 "CMS", 0);
-                        app.log_public_system("[WINLINK] Initiating email session via Web / CMS Telnet to cms.winlink.org:8772");
+                                                 cms_call, 0);
+                        app.log_public_system("[WINLINK] Initiating email session via Web / CMS Telnet to " +
+                                              cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) +
+                                              " (" + cms_call + ")");
                     } else {
                         hs.winlink.abort_session();
                         app.log_public_system("[WINLINK] Aborted email session.");
@@ -5968,6 +6100,7 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
                 return true;
             }
             case HS_WL_ABORT_SESSION:    hs.winlink.abort_session(); return true;
+            case HS_WL_CLEAR_SESSION:    hs.winlink.clear_session_log(); return true;
             case HS_WL_GW_SEARCH_BOX:    hs.text_focus = HsTextFocus::WlGwSearch; return true;
             case HS_WL_GW_MODE_ALL:      hs.winlink.filter_gateways(hs.winlink.gateway_search_query, "All", hs.hf_grid); return true;
             case HS_WL_GW_MODE_ARDOP:    hs.winlink.filter_gateways(hs.winlink.gateway_search_query, "ARDOP", hs.hf_grid); return true;
@@ -5977,6 +6110,21 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
             case HS_WL_CFG_CALL_BOX:     hs.text_focus = HsTextFocus::WlCfgCall; return true;
             case HS_WL_CFG_PASS_BOX:     hs.text_focus = HsTextFocus::WlCfgPass; return true;
             case HS_WL_CFG_GRID_BOX:     hs.text_focus = HsTextFocus::WlCfgGrid; return true;
+            case HS_WL_CFG_CMS_HOST_BOX: hs.text_focus = HsTextFocus::WlCfgCmsHost; return true;
+            case HS_WL_CFG_CMS_PORT_BOX: hs.text_focus = HsTextFocus::WlCfgCmsPort; return true;
+            case HS_WL_CFG_CMS_CALL_BOX: hs.text_focus = HsTextFocus::WlCfgCmsCall; return true;
+            case HS_WL_CFG_CMS_PASS_BOX: hs.text_focus = HsTextFocus::WlCfgCmsPass; return true;
+            case HS_WL_CFG_CMS_TMO_BOX:  hs.text_focus = HsTextFocus::WlCfgCmsTimeout; return true;
+            case HS_WL_CFG_CMS_RESET_BTN: {
+                auto& cfg = hamshack::get_app_config();
+                cfg.reset_winlink_cms_defaults();
+                hs.wl_cms_port_edit = std::to_string(cfg.winlink_cms_port);
+                hs.wl_cms_timeout_edit = std::to_string(cfg.winlink_cms_timeout_sec);
+                hs.winlink.modem_info = cfg.winlink_cms_server + ":" + hs.wl_cms_port_edit + " (" + cfg.winlink_cms_call + " • " + hs.wl_cms_timeout_edit + "s)";
+                cfg.save();
+                app.log_public_system("[WINLINK CONFIG] Reset CMS Telnet profile to cms.winlink.org:8772 (WL2K / CMSTELNET / 30s).");
+                return true;
+            }
             case HS_WL_CFG_TRANS_TELNET: {
                 auto& cfg = hamshack::get_app_config();
                 cfg.winlink_transport = 0;
@@ -6005,8 +6153,20 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
             }
             case HS_WL_CFG_SAVE_BTN: {
                 auto& cfg = hamshack::get_app_config();
+                if (cfg.winlink_cms_server.empty()) cfg.winlink_cms_server = "cms.winlink.org";
+                if (cfg.winlink_cms_call.empty()) cfg.winlink_cms_call = "WL2K";
+                if (cfg.winlink_cms_passcode.empty()) cfg.winlink_cms_passcode = "CMSTELNET";
+                int p = std::atoi(hs.wl_cms_port_edit.c_str());
+                cfg.winlink_cms_port = (p >= 1 && p <= 65535) ? p : 8772;
+                hs.wl_cms_port_edit = std::to_string(cfg.winlink_cms_port);
+                int tmo = std::atoi(hs.wl_cms_timeout_edit.c_str());
+                cfg.winlink_cms_timeout_sec = (tmo >= 5 && tmo <= 300) ? tmo : 30;
+                hs.wl_cms_timeout_edit = std::to_string(cfg.winlink_cms_timeout_sec);
+                hs.winlink.modem_info = cfg.winlink_cms_server + ":" + hs.wl_cms_port_edit + " (" + cfg.winlink_cms_call + " • " + hs.wl_cms_timeout_edit + "s)";
+                hs.text_focus = HsTextFocus::None;
                 cfg.save();
-                app.log_public_system("[WINLINK CONFIG] Saved configuration.");
+                app.log_public_system("[WINLINK CONFIG] Saved Winlink & CMS Telnet configuration (" +
+                                      cfg.winlink_cms_server + ":" + hs.wl_cms_port_edit + ").");
                 return true;
             }
 
@@ -6256,6 +6416,11 @@ inline bool handle_hamshack_key_char(HamShackSuite& hs, char c) {
         case HsTextFocus::WlCfgCall:   target = &cfg.winlink_callsign; max_len = 12; force_upper = true; break;
         case HsTextFocus::WlCfgPass:   target = &cfg.winlink_password; max_len = 32; force_upper = false; break;
         case HsTextFocus::WlCfgGrid:   target = &cfg.winlink_grid; max_len = 6; force_upper = true; break;
+        case HsTextFocus::WlCfgCmsHost:    target = &cfg.winlink_cms_server; max_len = 64; force_upper = false; break;
+        case HsTextFocus::WlCfgCmsPort:    target = &hs.wl_cms_port_edit; max_len = 5; force_upper = false; break;
+        case HsTextFocus::WlCfgCmsCall:    target = &cfg.winlink_cms_call; max_len = 12; force_upper = true; break;
+        case HsTextFocus::WlCfgCmsPass:    target = &cfg.winlink_cms_passcode; max_len = 32; force_upper = true; break;
+        case HsTextFocus::WlCfgCmsTimeout: target = &hs.wl_cms_timeout_edit; max_len = 3; force_upper = false; break;
         case HsTextFocus::LogQsoCall:  target = &hs.log_qso_dialog.call; max_len = 12; force_upper = true; break;
         case HsTextFocus::LogQsoGrid:  target = &hs.log_qso_dialog.grid; max_len = 6;  force_upper = true; break;
         case HsTextFocus::LogQsoMode:  target = &hs.log_qso_dialog.mode; max_len = 8;  force_upper = true; break;
@@ -6385,10 +6550,41 @@ inline bool handle_hamshack_key_char(HamShackSuite& hs, char c) {
             }
             cfg.save();
             hs.text_focus = HsTextFocus::None;
+        } else if (hs.text_focus == HsTextFocus::WlCfgCmsHost || hs.text_focus == HsTextFocus::WlCfgCmsPort ||
+                   hs.text_focus == HsTextFocus::WlCfgCmsCall || hs.text_focus == HsTextFocus::WlCfgCmsPass ||
+                   hs.text_focus == HsTextFocus::WlCfgCmsTimeout) {
+            auto& cfg = hamshack::get_app_config();
+            if (cfg.winlink_cms_server.empty()) cfg.winlink_cms_server = "cms.winlink.org";
+            if (cfg.winlink_cms_call.empty()) cfg.winlink_cms_call = "WL2K";
+            if (cfg.winlink_cms_passcode.empty()) cfg.winlink_cms_passcode = "CMSTELNET";
+            int p = std::atoi(hs.wl_cms_port_edit.c_str());
+            cfg.winlink_cms_port = (p >= 1 && p <= 65535) ? p : 8772;
+            hs.wl_cms_port_edit = std::to_string(cfg.winlink_cms_port);
+            int tmo = std::atoi(hs.wl_cms_timeout_edit.c_str());
+            cfg.winlink_cms_timeout_sec = (tmo >= 5 && tmo <= 300) ? tmo : 30;
+            hs.wl_cms_timeout_edit = std::to_string(cfg.winlink_cms_timeout_sec);
+            hs.winlink.modem_info = cfg.winlink_cms_server + ":" + hs.wl_cms_port_edit + " (" + cfg.winlink_cms_call + " • " + hs.wl_cms_timeout_edit + "s)";
+            cfg.save();
+            hs.text_focus = HsTextFocus::None;
         }
     } else if (c >= 0x20 && c < 0x7F && target->size() < max_len) {
+        if ((hs.text_focus == HsTextFocus::WlCfgCmsPort || hs.text_focus == HsTextFocus::WlCfgCmsTimeout) && (c < '0' || c > '9')) {
+            return true;
+        }
         char out_c = force_upper ? static_cast<char>(std::toupper(static_cast<unsigned char>(c))) : c;
         target->push_back(out_c);
+    }
+
+    if (hs.text_focus == HsTextFocus::WlCfgCmsHost || hs.text_focus == HsTextFocus::WlCfgCmsPort ||
+        hs.text_focus == HsTextFocus::WlCfgCmsCall || hs.text_focus == HsTextFocus::WlCfgCmsPass ||
+        hs.text_focus == HsTextFocus::WlCfgCmsTimeout) {
+        int p = std::atoi(hs.wl_cms_port_edit.c_str());
+        if (p >= 1 && p <= 65535) cfg.winlink_cms_port = p;
+        int tmo = std::atoi(hs.wl_cms_timeout_edit.c_str());
+        if (tmo >= 5 && tmo <= 300) cfg.winlink_cms_timeout_sec = tmo;
+        hs.winlink.modem_info = cfg.winlink_cms_server + ":" + std::to_string(cfg.winlink_cms_port) +
+                                " (" + cfg.winlink_cms_call + " • " + std::to_string(cfg.winlink_cms_timeout_sec) + "s)";
+        cfg.save();
     }
 
     if (hs.text_focus == HsTextFocus::Ft8DxCall || hs.text_focus == HsTextFocus::Ft8DxGrid ||

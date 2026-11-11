@@ -643,6 +643,17 @@ public:
         if (session_transcript.size() > 500) session_transcript.pop_front();
     }
 
+    void clear_session_log() {
+        std::lock_guard<std::recursive_mutex> lk(mtx);
+        session_transcript.clear();
+        if (!session_active) {
+            session_progress = 0.0f;
+            session_tx_count = 0;
+            session_rx_count = 0;
+            session_status = "IDLE — Click 'Send & Receive' to start Winlink session";
+        }
+    }
+
     // ========================================================================
     // SINGLE BIG BUTTON EXECUTION: Start Full Winlink Send & Receive Session
     // ========================================================================
@@ -688,9 +699,20 @@ private:
     void session_worker_thread(std::string transport, std::string call, std::string pass,
                                std::string grid, std::string gw_call, uint64_t gw_freq) {
         hamshack::ensure_winsock();
+        const auto& cfg = hamshack::get_app_config();
         bool is_telnet = (transport == "Telnet" || transport == "Internet" || transport == "CMS");
-        std::string host = is_telnet ? "cms.winlink.org" : "127.0.0.1";
-        int port = is_telnet ? 8772 : 8515;
+        std::string cms_host = cfg.winlink_cms_server.empty() ? "cms.winlink.org" : cfg.winlink_cms_server;
+        int cms_port = (cfg.winlink_cms_port >= 1 && cfg.winlink_cms_port <= 65535) ? cfg.winlink_cms_port : 8772;
+        std::string cms_remote_call = cfg.winlink_cms_call.empty() ? "WL2K" : cfg.winlink_cms_call;
+        std::string cms_gate_pass = cfg.winlink_cms_passcode.empty() ? "CMSTELNET" : cfg.winlink_cms_passcode;
+        int cms_timeout_s = std::clamp(cfg.winlink_cms_timeout_sec, 5, 300);
+
+        std::string host = is_telnet ? cms_host : (cfg.winlink_ardop_host.empty() ? "127.0.0.1" : cfg.winlink_ardop_host);
+        int port = is_telnet ? cms_port : (cfg.winlink_ardop_port > 0 ? cfg.winlink_ardop_port : 8515);
+        if (is_telnet && (gw_call.empty() || gw_call == "CMS")) {
+            gw_call = cms_remote_call;
+        }
+        modem_info = cms_host + ":" + std::to_string(cms_port) + " (" + cms_remote_call + " • " + std::to_string(cms_timeout_s) + "s)";
 
         // Auto-start built-in ARDOP TNC modem if operating over HF Radio
         if (!is_telnet) {
@@ -733,8 +755,9 @@ private:
             return;
         }
 
-        // 8 second timeout
-        hamshack::hs_set_rw_timeout_ms(active_sock_fd, 8000);
+        // Configured CMS Telnet timeout (default 30 seconds)
+        int timeout_ms = is_telnet ? (cms_timeout_s * 1000) : 15000;
+        hamshack::hs_set_rw_timeout_ms(active_sock_fd, timeout_ms);
 
         log_session("Connecting to Winlink RMS (" + host + ":" + port_str + ")...");
         if (::connect(active_sock_fd, res->ai_addr, static_cast<int>(res->ai_addrlen)) < 0) {
@@ -799,20 +822,24 @@ private:
 
         // 1. Initial Handshake & Authentication
         if (is_telnet) {
+            log_session("CMS Profile: " + cms_host + ":" + std::to_string(cms_port) +
+                        " | Remote Call: " + cms_remote_call + " | Timeout: " + std::to_string(cms_timeout_s) + "s");
             // Read until "Callsign :" prompt
             std::string prompt1 = read_until_char(':');
             if (!prompt1.empty()) log_session("< " + prompt1);
             if (prompt1.find("Callsign") != std::string::npos) {
                 send_line(call);
-                log_session("Sent Callsign: " + call);
+                log_session("Sent Callsign: " + call + " -> Remote Gate: " + cms_remote_call);
 
-                // Read until "Password :" prompt
+                // Read until "Password :" prompt (Telnet gate passcode — strictly CMSTELNET, case-insensitive)
                 std::string prompt2 = read_until_char(':');
                 if (!prompt2.empty()) log_session("< " + prompt2);
                 if (prompt2.find("Password") != std::string::npos) {
-                    std::string pass_to_send = pass.empty() ? "CMSTelnet" : pass;
-                    send_line(pass_to_send);
-                    log_session("Sent Password: " + std::string(pass_to_send.size(), '*'));
+                    if (hamshack::hs_sock_valid(active_sock_fd)) {
+                        std::string gate_wire = cms_gate_pass + "\r\n";
+                        ::send(active_sock_fd, gate_wire.data(), static_cast<int>(gate_wire.size()), 0);
+                        log_session("> " + std::string(cms_gate_pass.size(), '*') + " (Telnet Gate Passcode)");
+                    }
                 }
             }
 

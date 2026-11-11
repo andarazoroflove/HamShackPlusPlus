@@ -61,6 +61,17 @@ struct AppConfig {
     int winlink_transport = 0; // 0=Telnet CMS, 1=ARDOP HF, 2=Packet AX.25
     std::string winlink_cms_server = "cms.winlink.org";
     int winlink_cms_port = 8772;
+    std::string winlink_cms_call = "WL2K";
+    std::string winlink_cms_passcode = "CMSTELNET";
+    int winlink_cms_timeout_sec = 30;
+
+    void reset_winlink_cms_defaults() {
+        winlink_cms_server = "cms.winlink.org";
+        winlink_cms_port = 8772;
+        winlink_cms_call = "WL2K";
+        winlink_cms_passcode = "CMSTELNET";
+        winlink_cms_timeout_sec = 30;
+    }
     std::string winlink_ardop_host = "127.0.0.1";
     int winlink_ardop_port = 8515;
     int winlink_ardop_bandwidth = 1000; // 500, 1000, 2000
@@ -166,6 +177,9 @@ struct AppConfig {
         f << "winlink_transport=" << winlink_transport << "\n";
         f << "winlink_cms_server=" << winlink_cms_server << "\n";
         f << "winlink_cms_port=" << winlink_cms_port << "\n";
+        f << "winlink_cms_call=" << winlink_cms_call << "\n";
+        f << "winlink_cms_passcode=" << winlink_cms_passcode << "\n";
+        f << "winlink_cms_timeout_sec=" << winlink_cms_timeout_sec << "\n";
         f << "winlink_ardop_host=" << winlink_ardop_host << "\n";
         f << "winlink_ardop_port=" << winlink_ardop_port << "\n";
         f << "winlink_ardop_bandwidth=" << winlink_ardop_bandwidth << "\n";
@@ -259,7 +273,16 @@ struct AppConfig {
             }
             else if (key == "winlink_transport") winlink_transport = std::atoi(val.c_str());
             else if (key == "winlink_cms_server" && !val.empty()) winlink_cms_server = val;
-            else if (key == "winlink_cms_port") winlink_cms_port = std::atoi(val.c_str());
+            else if (key == "winlink_cms_port") {
+                int p = std::atoi(val.c_str());
+                if (p >= 1 && p <= 65535) winlink_cms_port = p;
+            }
+            else if (key == "winlink_cms_call" && !val.empty()) winlink_cms_call = val;
+            else if (key == "winlink_cms_passcode" && !val.empty()) winlink_cms_passcode = val;
+            else if (key == "winlink_cms_timeout_sec") {
+                int t = std::atoi(val.c_str());
+                if (t >= 5 && t <= 300) winlink_cms_timeout_sec = t;
+            }
             else if (key == "winlink_ardop_host" && !val.empty()) winlink_ardop_host = val;
             else if (key == "winlink_ardop_port") winlink_ardop_port = std::atoi(val.c_str());
             else if (key == "winlink_ardop_bandwidth") winlink_ardop_bandwidth = std::atoi(val.c_str());
