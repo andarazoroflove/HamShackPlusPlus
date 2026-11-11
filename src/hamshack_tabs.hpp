@@ -711,14 +711,21 @@ struct HamShackSuite {
         if (sstv_hf_tx) {
             want_ptt = true;
         }
+        if (ft8.tx_watchdog_tripped.exchange(false)) {
+            soundcard.halt_tx();
+            flrig.set_ptt(false);
+        }
+
+        const bool ft8_active = ft8.tx_enabled || ft8.tune_active || ft8.transmitting_now;
         if (want_ptt != flrig.ptt_active &&
-            (ft8.tx_enabled || ft8.tune_active || js8.tx_active || cw.tx_active || sstv_hf_tx || sstv_was_ptt_)) {
+            (ft8_active || ft8_was_ptt_ || js8.tx_active || cw.tx_active || sstv_hf_tx || sstv_was_ptt_)) {
             flrig.set_ptt(want_ptt);
             if (!want_ptt) {
                 js8.tx_active = false;
                 cw.tx_active = false;
             }
         }
+        ft8_was_ptt_ = ft8_active;
         sstv_was_ptt_ = sstv_hf_tx;
 
         // Drain lock-free APRS events into decoupled GUI-owned tables & shared Map Engine
@@ -738,6 +745,7 @@ struct HamShackSuite {
 
 private:
     uint64_t last_cw_chunk_ms_ = 0;
+    bool ft8_was_ptt_ = false;
     bool sstv_was_ptt_ = false;
 };
 
@@ -2109,12 +2117,21 @@ inline void render_ft8_ft4_workspace(RendererT& r, HamShackSuite& hs, POINT mous
     r.fill_round_rect(D2D1::RectF(cyc_bg.left, cyc_bg.top, cyc_bg.left + p_w, cyc_bg.bottom), 4.0f,
                       hs.ft8.transmitting_now ? r.hex_color(0xEF4444, 0.65f) : r.hex_color(0x10B981, 0.50f));
     r.draw_round_rect(cyc_bg, 4.0f, r.hex_color(0x26354D), 1.0f);
-    char cbuf[128];
-    std::snprintf(cbuf, sizeof(cbuf), "%s  %.1fs / %.1fs  |  Next: [Tx%d] %s",
-                  hs.ft8.transmitting_now ? "TRANSMITTING" : "MONITORING",
-                  hs.ft8.cycle_sec, hs.ft8.is_ft4 ? 7.5f : 15.0f,
-                  hs.ft8.active_tx_slot + 1,
-                  hs.ft8.tx_msgs[std::clamp(hs.ft8.active_tx_slot, 0, 5)].c_str());
+    char cbuf[160];
+    if (hs.ft8.tx_enabled) {
+        std::snprintf(cbuf, sizeof(cbuf), "%s [WD %d/%d]  %.1fs / %.1fs  |  Next: [Tx%d] %s",
+                      hs.ft8.transmitting_now ? "TRANSMITTING" : "TX ARMED",
+                      hs.ft8.unanswered_tx_cycles, hamshack::Ft8Ft4Engine::kMaxUnansweredTxCycles,
+                      hs.ft8.cycle_sec, hs.ft8.is_ft4 ? 7.5f : 15.0f,
+                      hs.ft8.active_tx_slot + 1,
+                      hs.ft8.tx_msgs[std::clamp(hs.ft8.active_tx_slot, 0, 5)].c_str());
+    } else {
+        std::snprintf(cbuf, sizeof(cbuf), "%s  %.1fs / %.1fs  |  Next: [Tx%d] %s",
+                      hs.ft8.transmitting_now ? "TRANSMITTING" : "MONITORING",
+                      hs.ft8.cycle_sec, hs.ft8.is_ft4 ? 7.5f : 15.0f,
+                      hs.ft8.active_tx_slot + 1,
+                      hs.ft8.tx_msgs[std::clamp(hs.ft8.active_tx_slot, 0, 5)].c_str());
+    }
     r.draw_text(cbuf, r.font_mono_small, cyc_bg, r.hex_color(0xF8FAFC), DWRITE_TEXT_ALIGNMENT_CENTER);
 
     // Right Column: Standard WSJT-X Messages Tx1 .. Tx6 stacked vertically
@@ -5380,6 +5397,10 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
                     hs.text_focus = HsTextFocus::None;
                     return true;
                 case HS_LOG_QSO_CANCEL:
+                    {
+                        std::lock_guard<std::recursive_mutex> lk(hs.ft8.mtx);
+                        hs.ft8.highlighted_call.clear();
+                    }
                     hs.log_qso_dialog.is_open = false;
                     hs.text_focus = HsTextFocus::None;
                     return true;
@@ -5736,7 +5757,24 @@ inline bool handle_hamshack_mouse_down(AppT& app, HamShackSuite& hs, POINT pt, H
                 if (hs.flrig.connected && hs.flrig.active_band_idx >= 0)
                     hs.flrig.select_band_for_mode(hs.flrig.active_band_idx, 1);
                 return true;
-            case HS_FT_ENABLE_TX: hs.ft8.tx_enabled = !hs.ft8.tx_enabled; return true;
+            case HS_FT_ENABLE_TX: {
+                bool now_armed = false;
+                {
+                    std::lock_guard<std::recursive_mutex> lk(hs.ft8.mtx);
+                    hs.ft8.tx_enabled = !hs.ft8.tx_enabled;
+                    hs.ft8.unanswered_tx_cycles = 0;
+                    now_armed = hs.ft8.tx_enabled;
+                    if (!now_armed) {
+                        hs.ft8.highlighted_call.clear();
+                        hs.ft8.transmitting_now = false;
+                    }
+                }
+                if (!now_armed) {
+                    hs.soundcard.halt_tx();
+                    hs.flrig.set_ptt(false);
+                }
+                return true;
+            }
             case HS_FT_HALT_TX:
                 hs.ft8.halt_tx_and_clear_working(hs.soundcard);
                 hs.flrig.set_ptt(false);

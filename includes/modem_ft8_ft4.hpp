@@ -190,10 +190,13 @@ public:
 
     int active_tx_slot = 5;         // 0..5 = Tx1..Tx6 (default Tx6 = CQ)
     std::array<std::string, 6> tx_msgs;
-    std::string highlighted_call = ""; // Pink highlight callsign (set on single-click or double-click)
+    std::string highlighted_call = ""; // Pink highlight callsign (cleared on QSO finish, Halt Tx, or watchdog)
+    static constexpr int kMaxUnansweredTxCycles = 15;
+    int unanswered_tx_cycles = 0;
 
     std::atomic<bool> qso_prompt_log_pending{false};
     std::atomic<bool> halt_tx_audio_pending{false};
+    std::atomic<bool> tx_watchdog_tripped{false};
     std::atomic<uint64_t> cached_dial_hz{14074000ULL};
 
     std::deque<DecodedFtMessage> band_activity;
@@ -727,10 +730,39 @@ public:
         }
     }
 
+    void finish_or_clear_qso_state_locked(bool disarm_tx = true) {
+        if (disarm_tx) tx_enabled = false;
+        disarm_after_slot_ = false;
+        disarm_slot_id_ = -1;
+        unanswered_tx_cycles = 0;
+        highlighted_call.clear();
+        dx_call.clear();
+        dx_grid.clear();
+        active_tx_slot = 5;
+        regenerate_std_msgs_locked();
+    }
+
+    // WSJT-X 15-cycle TX Watchdog: cuts off sending and clears pink highlight/working call if no reply after 15 sends
+    bool advance_or_trip_tx_watchdog_locked(const char* utc_buf, bool is_even_slot, int slot_id) {
+        if (unanswered_tx_cycles >= kMaxUnansweredTxCycles) {
+            finish_or_clear_qso_state_locked(true);
+            tx_watchdog_tripped.store(true);
+            DecodedFtMessage wd_rec{utc_buf ? utc_buf : "000000", 0, 0.0f, tx_freq_hz, is_ft4,
+                                    "--- TX WATCHDOG: Halted after 15 cycles with no reply ---",
+                                    false, false, true, is_even_slot, slot_id};
+            rx_freq_activity.push_back(wd_rec);
+            if (rx_freq_activity.size() > 150) rx_freq_activity.pop_front();
+            return true;
+        }
+        ++unanswered_tx_cycles;
+        return false;
+    }
+
     void start_sequence(int slot = 0) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
         disarm_after_slot_ = false;
         disarm_slot_id_ = -1;
+        unanswered_tx_cycles = 0;
         active_tx_slot = std::clamp(slot, 0, 5);
         tx_enabled = true;
         auto_seq = true;
@@ -832,6 +864,7 @@ public:
         highlighted_call = cand_norm;
         disarm_after_slot_ = false;
         disarm_slot_id_ = -1;
+        unanswered_tx_cycles = 0;
 
         rx_freq_hz = d.freq_hz;
         if (!hold_tx_freq) tx_freq_hz = d.freq_hz;
@@ -872,7 +905,7 @@ public:
             return false;
         }
         if (active_tx_slot == 5) {
-            tx_enabled = false;
+            finish_or_clear_qso_state_locked(true);
             return false;
         }
         tx_enabled = true;
@@ -902,6 +935,7 @@ public:
 
         // Start transmission immediately in phase with UTC slot (no time-remaining cutoff!)
         last_tx_slot_id = slot_now;
+        unanswered_tx_cycles = 1;
         int sent_slot_idx = std::clamp(active_tx_slot, 0, 5);
         std::string msg_to_send = tx_msgs[sent_slot_idx];
         std::vector<float> wave;
@@ -954,20 +988,13 @@ public:
         return true;
     }
 
-    // Halts transmission and clears the current station being worked if no QSO was made
+    // Halts transmission and clears the current station being worked & pink highlight
     void halt_tx_and_clear_working(SoundcardEngine& audio) {
         std::lock_guard<std::recursive_mutex> lk(mtx);
-        tx_enabled = false;
-        disarm_after_slot_ = false;
-        disarm_slot_id_ = -1;
         tune_active = false;
         transmitting_now = false;
         audio.halt_tx();
-        dx_call.clear();
-        dx_grid.clear();
-        highlighted_call.clear();
-        active_tx_slot = 5; // Reset sequence back to calling CQ
-        regenerate_std_msgs_locked();
+        finish_or_clear_qso_state_locked(true);
     }
 
     void record_worked_station_locked(const std::string& call, const std::string& grid, bool is_qsl = false) {
@@ -1368,14 +1395,11 @@ public:
             out_want_ptt = false;
         }
 
-        // Complete deferred disarm once the final RR73 / 73 TX slot ends
+        // Complete deferred disarm once the final RR73 / 73 TX slot ends (clears pink highlight & QSO state)
         double tx_dur = is_ft4 ? 5.04 : 12.64;
         double guard_end = period - 0.25;
         if (disarm_after_slot_ && (slot_id != disarm_slot_id_ || in_slot >= guard_end)) {
-            disarm_after_slot_ = false;
-            disarm_slot_id_ = -1;
-            tx_enabled = false;
-            active_tx_slot = 5;
+            finish_or_clear_qso_state_locked(true);
         }
 
         if (tune_active) {
@@ -1395,6 +1419,12 @@ public:
         // Check if we should transmit in our designated even/odd slot
         if (tx_enabled && (is_even_slot == tx_even_first) && in_slot < guard_end) {
             if (last_tx_slot_id != slot_id && in_slot < tx_dur) {
+                if (advance_or_trip_tx_watchdog_locked(utc_buf, is_even_slot, slot_id)) {
+                    audio.halt_tx();
+                    transmitting_now = false;
+                    out_want_ptt = false;
+                    return;
+                }
                 last_tx_slot_id = slot_id;
                 int sent_slot_idx = std::clamp(active_tx_slot, 0, 5);
                 std::string msg_to_send = tx_msgs[sent_slot_idx];
@@ -2295,9 +2325,7 @@ public:
                                              !from_norm.empty() && from_norm != my_norm &&
                                              !p.is_cq && !p.extra.empty() && !is_grid4_str(p.extra));
                 if (dx_working_other || other_in_qso_with_dx) {
-                    tx_enabled = false;
-                    disarm_after_slot_ = false;
-                    disarm_slot_id_ = -1;
+                    finish_or_clear_qso_state_locked(true);
                     halt_tx_audio_pending.store(true);
                 }
             }
@@ -2314,14 +2342,12 @@ public:
 
                     if (p.extra == "73") {
                         if (dx_norm.empty() || from_norm == dx_norm) {
-                            active_tx_slot = 5; // Tx6: CQ
-                            tx_enabled = false;
-                            disarm_after_slot_ = false;
-                            disarm_slot_id_ = -1;
+                            finish_or_clear_qso_state_locked(true);
                         }
                     } else if (already_logged || (already_prompted && !tx_enabled)) {
                         // Already logged (or already completed/prompted): disregard!
                     } else if (dx_norm.empty() || active_tx_slot == 5 || !tx_enabled || from_norm == dx_norm) {
+                        unanswered_tx_cycles = 0; // Reset 15-cycle TX watchdog on valid reply!
                         if (!p.call_from.empty() && p.call_from != my_call) {
                             dx_call = p.call_from;
                             highlighted_call = from_norm;
@@ -2469,6 +2495,10 @@ struct LogQsoDialogState {
             std::lock_guard<std::recursive_mutex> lk(ft.mtx);
             ft.qso_log.push_back(q);
             ft.record_worked_station_locked(call, grid, false);
+            ft.highlighted_call.clear(); // Clear pink highlight immediately once QSO is logged!
+            if (!ft.transmitting_now) {
+                ft.finish_or_clear_qso_state_locked(true);
+            }
             ft.adif_status_text = "hamshack_wsjtx_log.adi (" + std::to_string(ft.qso_log.size()) + " QSOs, " +
                                   std::to_string(ft.worked_calls.size()) + " calls, " +
                                   std::to_string(ft.worked_grids.size()) + " grids)";
